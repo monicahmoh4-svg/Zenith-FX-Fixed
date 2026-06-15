@@ -1030,9 +1030,15 @@ async function api(path, body = null, method = null) {
   };
   if (A.token) opts.headers['Authorization'] = 'Bearer ' + A.token;
   if (body)    opts.body = JSON.stringify(body);
-  const res = await fetch(path, opts);
+  const res  = await fetch(path, opts);
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `Request failed: ${res.status}`);
+  if (!res.ok) {
+    const err  = new Error(data.error || 'Request failed: ' + res.status);
+    err.code   = data.code  || null;
+    err.status = res.status;
+    err.data   = data;
+    throw err;
+  }
   return data;
 }
 
@@ -1081,10 +1087,58 @@ async function doLogin() {
     saveSession(d.session);
     initDash();
     goto('dashboard');
-    toast('👋 Welcome back!', `Hello, ${A.user.firstName}!`, 'success');
+    toast('👋 Welcome back!', `Hello, ${A.user.firstName || email}!`, 'success');
   } catch (err) {
-    toast('❌ Login Failed', err.message, 'error');
+    const msg = err.message || 'Login failed.';
+    const isUnverified =
+      err.code === 'EMAIL_NOT_CONFIRMED' ||
+      msg.includes('verify your email') ||
+      msg.includes('Email not confirmed') ||
+      msg.includes('confirmation link');
+    if (isUnverified) {
+      showVerifyBanner(email);
+    } else {
+      toast('❌ Login Failed', msg, 'error');
+    }
   } finally { resetBtn('liBtn','liTxt','Log In'); }
+}
+
+// Show a clear banner when email is not yet confirmed
+function showVerifyBanner(email) {
+  // Remove any existing banner
+  const old = document.getElementById('verifyBanner');
+  if (old) old.remove();
+  const banner = document.createElement('div');
+  banner.id = 'verifyBanner';
+  banner.style.cssText = 'background:rgba(31,156,240,.1);border:1px solid rgba(31,156,240,.4);border-radius:10px;padding:1rem 1.2rem;margin-top:1rem;font-size:.83rem;line-height:1.6;color:var(--text2)';
+  banner.innerHTML = `
+    <div style="font-weight:700;color:var(--accent2);margin-bottom:.35rem">📧 Verify your email first</div>
+    A confirmation link was sent to <strong style="color:var(--text)">${email}</strong>.<br>
+    Click the link in that email, then come back and log in.<br><br>
+    <span style="color:var(--text3);font-size:.76rem">Didn't receive it? Check your spam folder or </span>
+    <a onclick="resendVerification('${email}')" style="color:var(--accent2);cursor:pointer;font-size:.76rem">resend the link</a>.
+  `;
+  const card = document.querySelector('#pg-login .auth-card');
+  if (card) card.appendChild(banner);
+}
+
+async function resendVerification(email) {
+  try {
+    // Supabase resend — use signUp again with same email, it resends if already registered
+    const res = await fetch('/api/auth?action=resend-verification', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email }),
+    });
+    const d = await res.json().catch(() => ({}));
+    if (res.ok || d.success) {
+      toast('📧 Email Resent', `Confirmation link sent to ${email}. Check your inbox and spam.`, 'success');
+    } else {
+      toast('⚠️ Could Not Resend', d.error || 'Try registering again.', 'warn');
+    }
+  } catch {
+    toast('⚠️ Could Not Resend', 'Please try again in a moment.', 'warn');
+  }
 }
 
 async function doRegister() {
@@ -1102,9 +1156,38 @@ async function doRegister() {
   if (!ok) return;
   setBtnLoading('rgBtn','rgTxt','Creating account…');
   try {
-    await api('/api/auth?action=register', { firstName: first, lastName: last, email, password: pass, phone, country: document.getElementById('rgCountry').value });
-    toast('🎉 Account Created!', 'Check your email to verify, then log in.', 'success');
-    setTimeout(() => goto('login'), 2000);
+    const d = await api('/api/auth?action=register', {
+      firstName: first, lastName: last, email, password: pass,
+      phone, country: document.getElementById('rgCountry').value,
+    });
+    if (d.requiresVerification) {
+      // Replace the register form with a clear confirmation screen
+      const card = document.querySelector('#pg-register .auth-card');
+      if (card) {
+        card.innerHTML = `
+          <div style="text-align:center;padding:1rem 0">
+            <div style="font-size:3rem;margin-bottom:1rem">📧</div>
+            <div style="font-size:1.2rem;font-weight:800;margin-bottom:.5rem">Check your email</div>
+            <p style="color:var(--text2);font-size:.88rem;line-height:1.7;margin-bottom:1.3rem">
+              We sent a confirmation link to<br>
+              <strong style="color:var(--text)">${email}</strong>
+            </p>
+            <p style="color:var(--text2);font-size:.82rem;line-height:1.7;margin-bottom:1.5rem">
+              Click the link in the email to activate your account, then come back to log in.<br>
+              <span style="color:var(--text3);font-size:.75rem">Also check your spam / junk folder.</span>
+            </p>
+            <button class="btn btn-primary btn-full" onclick="goto('login')">Go to Login →</button>
+            <div style="margin-top:1rem;font-size:.78rem;color:var(--text3)">
+              Didn't get it?
+              <a onclick="resendVerification('${email}')" style="color:var(--accent2);cursor:pointer">Resend confirmation email</a>
+            </div>
+          </div>`;
+      }
+    } else {
+      // Email confirmation disabled in Supabase — auto-login
+      toast('🎉 Account Created!', d.message || 'Welcome to Zenith FX!', 'success');
+      setTimeout(() => goto('login'), 1500);
+    }
   } catch (err) {
     toast('❌ Registration Failed', err.message, 'error');
   } finally { resetBtn('rgBtn','rgTxt','Create Account — It\'s Free'); }
