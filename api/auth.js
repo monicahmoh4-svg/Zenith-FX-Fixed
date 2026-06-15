@@ -1,5 +1,6 @@
-// api/auth.js — Zenith FX Auth (fixed)
-// All clients created inside handlers to avoid cold-start crashes
+// api/auth.js — Zenith FX Auth v3
+// Uses signUp() so Supabase sends its own confirmation email automatically.
+// Requires in Supabase Dashboard → Authentication → Email Templates → confirm the redirect URL.
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -16,7 +17,8 @@ export default async function handler(req, res) {
     if (action === 'logout')          return await handleLogout(req, res);
     if (action === 'me')              return await handleMe(req, res);
     if (action === 'reset-password')  return await handleResetPassword(req, res);
-    if (action === 'update-password') return await handleUpdatePassword(req, res);
+    if (action === 'update-password')      return await handleUpdatePassword(req, res);
+    if (action === 'resend-verification')  return await handleResendVerification(req, res);
     return res.status(400).json({ error: 'Unknown action' });
   } catch (err) {
     console.error(`[auth/${action}] UNHANDLED:`, err?.message, err?.stack);
@@ -24,7 +26,7 @@ export default async function handler(req, res) {
   }
 }
 
-// ── helpers ──────────────────────────────────────────────────────────────────
+// ── CLIENT HELPERS ────────────────────────────────────────────────────────────
 function getServiceClient() {
   const { createClient } = require('@supabase/supabase-js');
   const url = process.env.SUPABASE_URL;
@@ -53,8 +55,8 @@ function profileToUser(authUser, profile) {
     lastName:     profile?.last_name   || authUser.user_metadata?.lastName   || authUser.user_metadata?.family_name || '',
     phone:        profile?.phone       || authUser.user_metadata?.phone       || '',
     country:      profile?.country     || authUser.user_metadata?.country     || 'KE',
-    demoBalance:  parseFloat(profile?.demo_balance  || 10000),
-    liveBalance:  parseFloat(profile?.live_balance  || 0),
+    demoBalance:  parseFloat(profile?.demo_balance ?? 10000),
+    liveBalance:  parseFloat(profile?.live_balance ?? 0),
     kycStatus:    profile?.kyc_status  || 'unverified',
     referralCode: profile?.referral_code || '',
     petapips:     parseInt(profile?.petapips || 0),
@@ -63,10 +65,13 @@ function profileToUser(authUser, profile) {
   };
 }
 
-// ── REGISTER ─────────────────────────────────────────────────────────────────
+// ── REGISTER ──────────────────────────────────────────────────────────────────
+// Uses the PUBLIC client signUp() — this is the ONLY way Supabase sends
+// the confirmation email automatically from its own email system.
 async function handleRegister(req, res) {
   const { email, password, firstName, lastName, phone, country } = req.body || {};
 
+  // ── validation ──
   if (!email || !password || !firstName || !lastName) {
     return res.status(400).json({ error: 'First name, last name, email and password are required.' });
   }
@@ -77,50 +82,66 @@ async function handleRegister(req, res) {
     return res.status(400).json({ error: 'Please enter a valid email address.' });
   }
 
-  const supabase = getServiceClient();
+  const cleanEmail = email.toLowerCase().trim();
+  const siteUrl   = process.env.NEXT_PUBLIC_SITE_URL || `https://${req.headers.host}`;
 
-  // Check if email already exists
-  const { data: existing } = await supabase
-    .from('profiles')
-    .select('id')
-    .eq('email', email.toLowerCase().trim())
-    .maybeSingle();
-
-  if (existing) {
-    return res.status(409).json({ error: 'An account with this email already exists. Please log in.' });
-  }
-
-  // Create auth user — email_confirm: true means Supabase sends confirmation email
-  const { data: authData, error: authErr } = await supabase.auth.admin.createUser({
-    email:          email.toLowerCase().trim(),
+  // Use PUBLIC client signUp() — Supabase automatically:
+  //   1. Creates the auth user
+  //   2. Sends a confirmation email with a magic link
+  //   3. The link redirects to emailRedirectTo after confirmation
+  const publicClient = getPublicClient();
+  const { data: signUpData, error: signUpError } = await publicClient.auth.signUp({
+    email:    cleanEmail,
     password,
-    email_confirm:  false, // set true to require email verification before login
-    user_metadata:  { firstName, lastName, phone: phone || null, country: country || 'KE' },
+    options: {
+      // This is the URL the confirmation link in the email redirects to
+      emailRedirectTo: `${siteUrl}/`,
+      // Store extra metadata — also available as user_metadata
+      data: {
+        firstName,
+        lastName,
+        phone:   phone   || null,
+        country: country || 'KE',
+      },
+    },
   });
 
-  if (authErr) {
-    console.error('[register] supabase.auth.admin.createUser error:', authErr);
-    if (authErr.message?.toLowerCase().includes('already')) {
-      return res.status(409).json({ error: 'Email already registered. Please log in.' });
+  if (signUpError) {
+    console.error('[register] signUp error:', signUpError);
+    // Supabase returns this when the email is already registered
+    if (
+      signUpError.message?.toLowerCase().includes('already registered') ||
+      signUpError.message?.toLowerCase().includes('user already registered') ||
+      signUpError.status === 422
+    ) {
+      return res.status(409).json({ error: 'An account with this email already exists. Please log in.' });
     }
-    return res.status(400).json({ error: authErr.message || 'Could not create account.' });
+    return res.status(400).json({ error: signUpError.message || 'Registration failed.' });
   }
 
-  const userId = authData.user.id;
-  const referralCode = genCode();
+  // signUpData.user will exist even before confirmation.
+  // signUpData.session will be null if email confirmation is required.
+  const userId = signUpData?.user?.id;
 
-  // Upsert profile row (trigger may have already created it)
-  const { error: profileErr } = await supabase.from('profiles').upsert({
+  if (!userId) {
+    // Should not happen, but guard anyway
+    return res.status(500).json({ error: 'Account creation failed. Please try again.' });
+  }
+
+  // Upsert the profile row immediately using the service client.
+  // The DB trigger (handle_new_user) may also do this — upsert is safe either way.
+  const serviceClient = getServiceClient();
+  const { error: profileErr } = await serviceClient.from('profiles').upsert({
     id:            userId,
-    email:         email.toLowerCase().trim(),
+    email:         cleanEmail,
     first_name:    firstName,
     last_name:     lastName,
-    phone:         phone || null,
-    country:       country || 'KE',
+    phone:         phone    || null,
+    country:       country  || 'KE',
     demo_balance:  10000.00,
     live_balance:  0.00,
     kyc_status:    'unverified',
-    referral_code: referralCode,
+    referral_code: genCode(),
     petapips:      0,
     tier:          'bronze',
     created_at:    new Date().toISOString(),
@@ -128,20 +149,27 @@ async function handleRegister(req, res) {
   }, { onConflict: 'id' });
 
   if (profileErr) {
-    console.error('[register] profile upsert error:', profileErr);
-    // Not fatal — trigger may have already created the profile
+    // Non-fatal — log but don't fail the registration
+    console.error('[register] profile upsert error (non-fatal):', profileErr.message);
   }
 
-  // Send welcome email — wrapped in try/catch so email failure doesn't break registration
+  // Send our own branded welcome email IN ADDITION to Supabase's confirmation email.
+  // Wrapped in try/catch — SMTP failure must never break registration.
   try {
-    await sendWelcomeEmail(email, firstName);
+    await sendWelcomeEmail(cleanEmail, firstName, siteUrl);
   } catch (emailErr) {
     console.error('[register] welcome email failed (non-fatal):', emailErr.message);
   }
 
   return res.status(201).json({
     success: true,
-    message: 'Account created successfully! You can now log in.',
+    // Tell the frontend whether the user still needs to verify their email.
+    // session is null  → email confirmation required (standard flow)
+    // session exists   → email confirmation disabled in Supabase (auto-login)
+    requiresVerification: !signUpData?.session,
+    message: signUpData?.session
+      ? 'Account created! You are now logged in.'
+      : 'Account created! Please check your email and click the confirmation link to activate your account.',
   });
 }
 
@@ -152,44 +180,55 @@ async function handleLogin(req, res) {
     return res.status(400).json({ error: 'Email and password are required.' });
   }
 
-  const supabase = getPublicClient();
-  const { data, error } = await supabase.auth.signInWithPassword({
-    email: email.toLowerCase().trim(),
+  const publicClient = getPublicClient();
+  const { data, error } = await publicClient.auth.signInWithPassword({
+    email:    email.toLowerCase().trim(),
     password,
   });
 
   if (error) {
     console.error('[login] error:', error.message);
-    if (error.message?.includes('Invalid login') || error.message?.includes('invalid_credentials')) {
+    if (
+      error.message?.includes('Invalid login') ||
+      error.message?.includes('invalid_credentials') ||
+      error.message?.includes('Invalid email or password')
+    ) {
       return res.status(401).json({ error: 'Incorrect email or password.' });
     }
     if (error.message?.includes('Email not confirmed')) {
-      return res.status(403).json({ error: 'Please verify your email first. Check your inbox.' });
+      return res.status(403).json({
+        error: 'Please verify your email first. Check your inbox for a confirmation link.',
+        code:  'EMAIL_NOT_CONFIRMED',
+      });
     }
     return res.status(401).json({ error: error.message || 'Login failed.' });
   }
 
-  // Fetch profile
-  const sb2 = getServiceClient();
-  const { data: profile } = await sb2
+  // Fetch profile from our profiles table
+  const serviceClient = getServiceClient();
+  const { data: profile } = await serviceClient
     .from('profiles')
     .select('*')
     .eq('id', data.user.id)
     .maybeSingle();
 
-  // If profile missing (edge case), create it
+  // Profile may not exist yet if trigger hasn't run — create it
   if (!profile) {
-    await sb2.from('profiles').upsert({
+    const meta = data.user.user_metadata || {};
+    await serviceClient.from('profiles').upsert({
       id:            data.user.id,
       email:         data.user.email,
-      first_name:    data.user.user_metadata?.firstName || data.user.user_metadata?.given_name || '',
-      last_name:     data.user.user_metadata?.lastName  || data.user.user_metadata?.family_name || '',
+      first_name:    meta.firstName || meta.given_name  || '',
+      last_name:     meta.lastName  || meta.family_name || '',
+      phone:         meta.phone     || null,
+      country:       meta.country   || 'KE',
       demo_balance:  10000.00,
       live_balance:  0.00,
       kyc_status:    'unverified',
       referral_code: genCode(),
       petapips:      0,
       tier:          'bronze',
+      updated_at:    new Date().toISOString(),
     }, { onConflict: 'id' });
   }
 
@@ -206,9 +245,9 @@ async function handleLogin(req, res) {
 
 // ── GOOGLE OAUTH URL ──────────────────────────────────────────────────────────
 async function handleGoogleUrl(req, res) {
-  const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || `https://${req.headers.host}`;
-  const supabase = getPublicClient();
-  const { data, error } = await supabase.auth.signInWithOAuth({
+  const siteUrl      = process.env.NEXT_PUBLIC_SITE_URL || `https://${req.headers.host}`;
+  const publicClient = getPublicClient();
+  const { data, error } = await publicClient.auth.signInWithOAuth({
     provider: 'google',
     options:  { redirectTo: `${siteUrl}/` },
   });
@@ -222,12 +261,16 @@ async function handleLogout(req, res) {
   if (token) {
     try {
       const { createClient } = require('@supabase/supabase-js');
-      const client = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
-        global: { headers: { Authorization: `Bearer ${token}` } },
-        auth:   { autoRefreshToken: false, persistSession: false },
-      });
+      const client = createClient(
+        process.env.SUPABASE_URL,
+        process.env.SUPABASE_ANON_KEY,
+        {
+          global: { headers: { Authorization: `Bearer ${token}` } },
+          auth:   { autoRefreshToken: false, persistSession: false },
+        }
+      );
       await client.auth.signOut();
-    } catch (e) { /* ignore */ }
+    } catch (e) { /* ignore — token may already be expired */ }
   }
   return res.status(200).json({ success: true });
 }
@@ -237,11 +280,13 @@ async function handleMe(req, res) {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: 'Not authenticated.' });
 
-  const supabase = getServiceClient();
-  const { data: { user }, error } = await supabase.auth.getUser(token);
-  if (error || !user) return res.status(401).json({ error: 'Session expired. Please log in again.' });
+  const serviceClient = getServiceClient();
+  const { data: { user }, error } = await serviceClient.auth.getUser(token);
+  if (error || !user) {
+    return res.status(401).json({ error: 'Session expired. Please log in again.' });
+  }
 
-  const { data: profile } = await supabase
+  const { data: profile } = await serviceClient
     .from('profiles')
     .select('*')
     .eq('id', user.id)
@@ -255,11 +300,12 @@ async function handleResetPassword(req, res) {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Email is required.' });
 
-  const siteUrl  = process.env.NEXT_PUBLIC_SITE_URL || `https://${req.headers.host}`;
-  const supabase = getPublicClient();
-  const { error } = await supabase.auth.resetPasswordForEmail(email.toLowerCase().trim(), {
-    redirectTo: `${siteUrl}/?page=reset-password`,
-  });
+  const siteUrl      = process.env.NEXT_PUBLIC_SITE_URL || `https://${req.headers.host}`;
+  const publicClient = getPublicClient();
+  const { error } = await publicClient.auth.resetPasswordForEmail(
+    email.toLowerCase().trim(),
+    { redirectTo: `${siteUrl}/?page=reset-password` }
+  );
   if (error) throw error;
   return res.status(200).json({ success: true, message: 'Password reset email sent.' });
 }
@@ -267,62 +313,98 @@ async function handleResetPassword(req, res) {
 // ── UPDATE PASSWORD ───────────────────────────────────────────────────────────
 async function handleUpdatePassword(req, res) {
   const { password } = req.body || {};
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token)         return res.status(401).json({ error: 'Not authenticated.' });
-  if (!password || password.length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters.' });
-
+  const token        = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: 'Not authenticated.' });
+  if (!password || password.length < 8) {
+    return res.status(400).json({ error: 'Password must be at least 8 characters.' });
+  }
   const { createClient } = require('@supabase/supabase-js');
-  const client = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY, {
-    global: { headers: { Authorization: `Bearer ${token}` } },
-    auth:   { autoRefreshToken: false, persistSession: false },
-  });
+  const client = createClient(
+    process.env.SUPABASE_URL,
+    process.env.SUPABASE_ANON_KEY,
+    {
+      global: { headers: { Authorization: `Bearer ${token}` } },
+      auth:   { autoRefreshToken: false, persistSession: false },
+    }
+  );
   const { error } = await client.auth.updateUser({ password });
   if (error) throw error;
   return res.status(200).json({ success: true });
 }
 
-// ── WELCOME EMAIL ─────────────────────────────────────────────────────────────
-async function sendWelcomeEmail(toEmail, firstName) {
-  const host = process.env.SMTP_HOST;
-  const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASS;
-  if (!host || !user || !pass) {
-    console.warn('[email] SMTP env vars not set — skipping welcome email');
+// ── RESEND VERIFICATION EMAIL ────────────────────────────────────────────────
+async function handleResendVerification(req, res) {
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'Email is required.' });
+
+  const siteUrl      = process.env.NEXT_PUBLIC_SITE_URL || `https://${req.headers.host}`;
+  const publicClient = getPublicClient();
+
+  // Calling signUp again on an existing unconfirmed user resends the confirmation email
+  const { error } = await publicClient.auth.resend({
+    type:  'signup',
+    email: email.toLowerCase().trim(),
+    options: { emailRedirectTo: `${siteUrl}/` },
+  });
+
+  if (error) {
+    console.error('[resend-verification]', error.message);
+    // Don't expose whether the email exists — just say it was sent
+    return res.status(200).json({ success: true, message: 'If that email is registered, a confirmation link has been sent.' });
+  }
+
+  return res.status(200).json({ success: true, message: 'Confirmation email resent. Check your inbox and spam folder.' });
+}
+
+// ── WELCOME EMAIL (branded, sent alongside Supabase's confirmation email) ─────
+async function sendWelcomeEmail(toEmail, firstName, siteUrl) {
+  const smtpHost = process.env.SMTP_HOST;
+  const smtpUser = process.env.SMTP_USER;
+  const smtpPass = process.env.SMTP_PASS;
+
+  if (!smtpHost || !smtpUser || !smtpPass) {
+    console.warn('[email] SMTP env vars not configured — skipping welcome email');
     return;
   }
 
-  const nodemailer = require('nodemailer');
+  const nodemailer  = require('nodemailer');
   const transporter = nodemailer.createTransport({
-    host,
+    host:   smtpHost,
     port:   parseInt(process.env.SMTP_PORT || '587'),
     secure: false,
-    auth:   { user, pass },
+    auth:   { user: smtpUser, pass: smtpPass },
     tls:    { rejectUnauthorized: false },
   });
 
-  const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || 'https://zenithfx.vercel.app';
-
   await transporter.sendMail({
-    from:    process.env.SMTP_FROM || `"Zenith FX" <${user}>`,
+    from:    process.env.SMTP_FROM || `"Zenith FX" <${smtpUser}>`,
     to:      toEmail,
-    subject: '🎉 Welcome to Zenith FX — Your account is ready',
+    subject: '🎉 Welcome to Zenith FX — Confirm your email to get started',
     html: `
 <div style="font-family:Inter,Arial,sans-serif;max-width:520px;margin:0 auto;background:#0d1117;color:#e6edf3;border-radius:12px;overflow:hidden;border:1px solid #30363d">
   <div style="background:linear-gradient(135deg,#1f9cf0,#22d3ee);padding:1.6rem 2rem">
     <div style="font-size:1.5rem;font-weight:900;color:#fff;letter-spacing:-0.5px">Zenith FX</div>
-    <div style="font-size:.85rem;color:rgba(255,255,255,.8);margin-top:.25rem">Trade Smart, Rise Higher</div>
+    <div style="font-size:.85rem;color:rgba(255,255,255,.8);margin-top:.2rem">Trade Smart, Rise Higher</div>
   </div>
   <div style="padding:2rem">
-    <h2 style="margin:0 0 .9rem;font-size:1.3rem;font-weight:700">Welcome, ${firstName}! 🎉</h2>
-    <p style="color:#8b949e;line-height:1.7;margin-bottom:1rem">Your Zenith FX account is ready. You have a <strong style="color:#3fb950">$10,000 demo balance</strong> to start practicing immediately — no deposit needed.</p>
+    <h2 style="margin:0 0 .9rem;font-size:1.2rem;font-weight:700">Welcome, ${firstName}! 🎉</h2>
+    <p style="color:#8b949e;line-height:1.7;margin-bottom:1rem">
+      Your Zenith FX account has been created. You will receive a separate email from us with a
+      <strong style="color:#fff">confirmation link</strong> — click it to activate your account and log in.
+    </p>
     <div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1rem;margin-bottom:1.4rem">
-      <div style="font-size:.75rem;color:#8b949e;margin-bottom:.3rem;text-transform:uppercase;letter-spacing:.5px">Demo Balance</div>
-      <div style="font-size:1.6rem;font-weight:800;color:#3fb950;font-family:monospace">$10,000.00</div>
+      <div style="font-size:.72rem;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin-bottom:.3rem">Demo Balance Ready</div>
+      <div style="font-size:1.5rem;font-weight:800;color:#3fb950;font-family:monospace">$10,000.00</div>
+      <div style="font-size:.75rem;color:#8b949e;margin-top:.2rem">Available immediately after email confirmation</div>
     </div>
-    <p style="color:#8b949e;line-height:1.7;margin-bottom:1.4rem">Ready to go live? Deposit via <strong style="color:#fff">M-Pesa</strong> from as little as <strong style="color:#fff">KES 100</strong>.</p>
-    <a href="${siteUrl}" style="display:inline-block;background:linear-gradient(135deg,#1f9cf0,#38bdf8);color:#fff;font-weight:700;padding:.8rem 1.8rem;border-radius:8px;text-decoration:none;font-size:.92rem">Start Trading →</a>
+    <p style="color:#8b949e;line-height:1.7;margin-bottom:1.4rem">
+      After confirming, you can deposit via <strong style="color:#fff">M-Pesa</strong> from as little as <strong style="color:#fff">KES 100</strong> to start live trading.
+    </p>
+    <a href="${siteUrl}" style="display:inline-block;background:linear-gradient(135deg,#1f9cf0,#38bdf8);color:#fff;font-weight:700;padding:.8rem 1.8rem;border-radius:8px;text-decoration:none;font-size:.9rem">
+      Go to Zenith FX →
+    </a>
   </div>
-  <div style="padding:.9rem 2rem 1.3rem;text-align:center;color:#6e7681;font-size:.72rem;border-top:1px solid #21262d">
+  <div style="padding:.9rem 2rem 1.2rem;text-align:center;color:#6e7681;font-size:.7rem;border-top:1px solid #21262d">
     Zenith FX Limited · support@zenithfx.io<br>
     ⚠️ Trading involves risk. Never invest money you cannot afford to lose.
   </div>
