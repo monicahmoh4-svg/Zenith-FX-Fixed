@@ -1,185 +1,161 @@
-# Zenith FX — Trading Platform
+# Zenith FX — Production Deployment Guide
 
-> Africa's leading binary options & multi-asset trading platform. Built to look and feel exactly like TagOption.ke with the Zenith FX brand.
+## Files in This Project
+
+```
+zenithfx/
+├── index.html              ← Full SPA frontend
+├── api/
+│   ├── mpesa.js            ← Real Lipana.dev STK push + callback + withdraw
+│   ├── auth.js             ← Register, login, Google OAuth, password reset
+│   ├── email.js            ← Transactional emails via SMTP
+│   ├── kyc.js              ← KYC upload to Supabase Storage + admin review
+│   └── trade.js            ← Place/settle trades, history, balance sync
+├── supabase-schema.sql     ← Run once in Supabase SQL editor
+├── vercel.json             ← Vercel routing config (do not edit)
+├── package.json            ← Node dependencies
+├── .env.example            ← All required environment variables
+└── README.md               ← This file
+```
 
 ---
 
-## 🚀 Deploy to Vercel in 5 Minutes
+## Step 1 — Supabase Setup (5 minutes)
 
-### Step 1 — Push to GitHub
+1. Go to **https://supabase.com** → New Project (free tier is fine)
+2. Choose a region close to Kenya (e.g. `eu-central-1`)
+3. Once created, go to **SQL Editor → New Query**
+4. Paste the entire contents of `supabase-schema.sql` and click **Run**
+5. Go to **Project Settings → API** and copy:
+   - `Project URL` → this is your `SUPABASE_URL`
+   - `anon public` key → `SUPABASE_ANON_KEY`
+   - `service_role` key → `SUPABASE_SERVICE_ROLE_KEY`
 
+### Enable Google OAuth in Supabase
+1. Supabase Dashboard → **Authentication → Providers → Google** → Enable
+2. Paste your Google Client ID and Secret (from Step 3 below)
+3. Copy the **Callback URL** shown (e.g. `https://xxxx.supabase.co/auth/v1/callback`)
+
+---
+
+## Step 2 — Lipana.dev Setup (2 minutes)
+
+1. Go to **https://lipana.dev** → Sign up / Log in
+2. Connect your Safaricom Daraja credentials (they walk you through it)
+3. Dashboard → **API Keys** → copy your `Secret Key` (starts with `lip_sk_live_`)
+4. Dashboard → **Webhooks** → Add webhook:
+   - URL: `https://YOUR-VERCEL-URL.vercel.app/api/mpesa?action=callback`
+   - Events: `payment.success`, `payment.failed`
+   - Copy the **Webhook Secret** shown
+
+---
+
+## Step 3 — Google OAuth Setup (3 minutes)
+
+1. Go to **https://console.cloud.google.com**
+2. Create a new project (or use existing)
+3. APIs & Services → **Credentials** → Create Credentials → OAuth 2.0 Client ID
+4. Application type: **Web application**
+5. Authorized redirect URIs → Add:
+   ```
+   https://YOUR-SUPABASE-PROJECT.supabase.co/auth/v1/callback
+   ```
+6. Copy **Client ID** and **Client Secret**
+
+---
+
+## Step 4 — Gmail App Password for Email (2 minutes)
+
+1. Go to your Google Account → **Security → 2-Step Verification** (must be ON)
+2. Search for **App Passwords** → Generate one for "Mail"
+3. Copy the 16-character password (e.g. `abcd efgh ijkl mnop`)
+
+---
+
+## Step 5 — Deploy to GitHub + Vercel
+
+### Push to GitHub
 ```bash
-# 1. Create a new repo on github.com (e.g. zenithfx)
-# 2. Then in your terminal:
-
 git init
 git add .
-git commit -m "Initial commit — Zenith FX trading platform"
+git commit -m "Zenith FX v2 — production"
 git branch -M main
 git remote add origin https://github.com/YOUR_USERNAME/zenithfx.git
 git push -u origin main
 ```
 
-### Step 2 — Deploy on Vercel
-
-1. Go to [vercel.com](https://vercel.com) → **New Project**
+### Deploy on Vercel
+1. Go to **https://vercel.com** → New Project
 2. Import your `zenithfx` GitHub repo
-3. Leave all settings as default — Vercel auto-detects the config
-4. Click **Deploy**
-5. Your site is live at `https://zenithfx.vercel.app`
-
-### Step 3 — Add Environment Variables (Required for M-Pesa)
-
-In your Vercel project → **Settings → Environment Variables**, add:
-
-| Key | Value | Description |
-|-----|-------|-------------|
-| `LIPANA_API_KEY` | `your_key_here` | From lipana.dev dashboard |
-| `LIPANA_BASE_URL` | `https://api.lipana.dev` | Lipana API base URL |
-| `SITE_URL` | `https://yourdomain.com` | Your production URL |
-| `USD_KES_RATE` | `130` | USD to KES exchange rate |
-
-> ⚡ After adding env vars, go to **Deployments → Redeploy** to apply them.
+3. Framework: **Other** (leave default)
+4. Click **Deploy** — first deploy will work but M-Pesa won't until env vars are set
 
 ---
 
-## 📁 Project Structure
+## Step 6 — Add Environment Variables in Vercel
+
+Vercel Dashboard → Your Project → **Settings → Environment Variables**
+
+Add each of these:
+
+| Variable | Value | Where to get it |
+|----------|-------|-----------------|
+| `NEXT_PUBLIC_SITE_URL` | `https://zenithfx.vercel.app` | Your Vercel URL |
+| `SUPABASE_URL` | `https://xxxx.supabase.co` | Supabase → Settings → API |
+| `SUPABASE_ANON_KEY` | `eyJ...` | Supabase → Settings → API |
+| `SUPABASE_SERVICE_ROLE_KEY` | `eyJ...` | Supabase → Settings → API |
+| `LIPANA_SECRET_KEY` | `lip_sk_live_XXXX` | Lipana Dashboard → API Keys |
+| `LIPANA_WEBHOOK_SECRET` | `whsec_XXXX` | Lipana Dashboard → Webhooks |
+| `SMTP_HOST` | `smtp.gmail.com` | Fixed |
+| `SMTP_PORT` | `587` | Fixed |
+| `SMTP_USER` | `mwebidouglas08@gmail.com` | Your Gmail |
+| `SMTP_PASS` | `abcd efgh ijkl mnop` | Gmail App Password |
+| `SMTP_FROM` | `Zenith FX <noreply@zenithfx.io>` | Your sender name |
+| `ADMIN_EMAIL` | `mwebidouglas08@gmail.com` | Your admin email |
+| `USD_KES_RATE` | `130` | Adjust as needed |
+
+After adding all variables → **Deployments → Redeploy** (top right → Redeploy)
+
+---
+
+## Step 7 — Update Lipana Webhook URL
+
+After Vercel gives you a URL (e.g. `https://zenithfx.vercel.app`):
+1. Go to Lipana Dashboard → Webhooks
+2. Update the URL to: `https://zenithfx.vercel.app/api/mpesa?action=callback`
+3. Save
+
+---
+
+## How Real M-Pesa Flow Works
 
 ```
-zenithfx/
-├── index.html          # Full single-page app (home + auth + dashboard)
-├── api/
-│   └── mpesa.js        # Vercel serverless function — Lipana.dev STK push
-├── vercel.json         # Vercel routing config
-├── package.json        # Node.js deps for serverless functions
-└── README.md           # This file
+User enters phone + amount
+        ↓
+Frontend → POST /api/mpesa?action=stkpush
+        ↓
+Server → Lipana API (push-stk) → Safaricom sends PIN prompt to phone
+        ↓
+User enters M-Pesa PIN on phone
+        ↓
+Safaricom → Lipana → POST /api/mpesa?action=callback (webhook)
+        ↓
+Server verifies Lipana signature, updates transaction status in Supabase
+        ↓
+Frontend polls /api/mpesa?action=status every 3 seconds
+        ↓
+Status = "success" → balance credited, email sent, UI updated
 ```
 
 ---
 
-## 💳 M-Pesa Integration (Lipana.dev)
+## Custom Domain (Optional)
 
-### How it works
-
-1. User enters their Safaricom number and amount
-2. Frontend calls `/api/mpesa?action=stkpush`
-3. Server calls **Lipana.dev** API to send an STK Push
-4. User receives a PIN prompt on their phone
-5. Frontend polls `/api/mpesa?action=status` every 3 seconds
-6. On success, balance is credited instantly
-
-### Getting your Lipana.dev API Key
-
-1. Go to [lipana.dev](https://lipana.dev)
-2. Create a free account
-3. Connect your Safaricom Daraja credentials
-4. Copy your API key
-5. Paste it into Vercel env variables as `LIPANA_API_KEY`
-
-### Testing Without API Key
-
-The platform works in **simulation mode** without an API key — deposits are credited automatically after 4 seconds. Perfect for demos.
-
----
-
-## 🎯 Features
-
-### Public Pages
-- ✅ Hero with live-animated badge ("Over 1 million traders")
-- ✅ Live price ticker (BTC, ETH, EUR/USD, Gold, V10, etc.)
-- ✅ Markets grid (Synthetics, Digits, Forex, Crypto, Commodities, Indices)
-- ✅ Features section
-- ✅ How It Works (3 steps)
-- ✅ Testimonials from African traders
-- ✅ Affiliate program section
-- ✅ Risk warning + Footer
-
-### Auth System
-- ✅ Login with email + password validation
-- ✅ Register with full form validation
-- ✅ Password strength meter
-- ✅ Show/hide password toggle
-- ✅ Social login buttons (Google, Phone)
-- ✅ Remember me + Forgot password
-
-### Trader Dashboard
-- ✅ **PetaPips** branding, *Unajua Kwa Mbae*, `mwebidouglas08@gmail.com`
-- ✅ Demo / Live account toggle
-- ✅ Demo balance starts at **$10,000** with reset button
-- ✅ Sidebar navigation with all 9 sections
-- ✅ Mobile-responsive collapsible sidebar
-
-### Trading Engine
-- ✅ Real-time animated chart (Line / Candles / Area)
-- ✅ 35+ assets across 5 categories with live price simulation
-- ✅ Asset picker with search
-- ✅ Binary Options + Multiplier modes
-- ✅ Contract types: Rise/Fall, Even/Odd, Match/Differ, Over/Under
-- ✅ Digit distribution grid (0–9)
-- ✅ Stake input with quick-add buttons (+1, +5, +10, +25, +50, +100)
-- ✅ Duration selector (ticks / seconds / minutes / hours)
-- ✅ Live payout calculator
-- ✅ Open positions with live tick countdown
-- ✅ Auto-settle with win/loss toast notifications
-- ✅ Balance deducted on trade, credited on win
-
-### Deposit (M-Pesa via Lipana.dev)
-- ✅ M-Pesa STK Push (Lipana.dev API)
-- ✅ Bank transfer with reference
-- ✅ Crypto deposit address
-- ✅ Card payment form
-- ✅ Amount presets (500, 1K, 2.5K, 5K, 10K)
-- ✅ Waiting modal with spinner
-
-### Withdrawals
-- ✅ M-Pesa B2C via Lipana.dev
-- ✅ Balance check + min amount validation
-- ✅ Demo account guard
-- ✅ Amount presets
-
-### Other Sections
-- ✅ KYC with 5-step progress tracker + document upload
-- ✅ Copy Trading — 4 trader cards with stats
-- ✅ Affiliate — referral link + copy button + stats
-- ✅ Loyalty — PetaPips gold tier with progress bar
-- ✅ Profile — edit info, change password, 2FA toggle
-
----
-
-## 🎨 Design
-
-Exact TagOption.ke color palette:
-
-| Token | Value | Usage |
-|-------|-------|-------|
-| `--bg` | `#0d1117` | Page background |
-| `--bg2` | `#161b22` | Cards, sidebar |
-| `--bg3` | `#1c2333` | Input fields |
-| `--accent` | `#1f9cf0` | Primary blue (TagOption exact) |
-| `--accent2` | `#38bdf8` | Cyan highlights |
-| `--green` | `#3fb950` | Rise / Win |
-| `--red` | `#f85149` | Fall / Loss |
-| `--gold` | `#d29922` | PetaPips / Gold tier |
-| `--text` | `#e6edf3` | Primary text |
-| `--text2` | `#8b949e` | Secondary text |
-
-Font: **Inter** (same as TagOption) + **JetBrains Mono** for prices
-
----
-
-## 🔧 Custom Domain on Vercel
-
-1. Vercel project → **Settings → Domains**
-2. Add `zenithfx.io` (or your domain)
-3. Update DNS at your registrar:
-   - `A` record → `76.76.21.21`
-   - `CNAME www` → `cname.vercel-dns.com`
-4. SSL auto-configured by Vercel
-
----
-
-## 📞 Support
-
-- Email: support@zenithfx.io
-- Lipana.dev docs: https://lipana.dev/docs
-- Vercel docs: https://vercel.com/docs
+1. Vercel → Settings → Domains → Add `zenithfx.io`
+2. At your domain registrar, add:
+   - `A` record: `76.76.21.21`
+   - `CNAME www`: `cname.vercel-dns.com`
+3. SSL auto-provisioned by Vercel (takes ~2 minutes)
+4. Update `NEXT_PUBLIC_SITE_URL` to `https://zenithfx.io` and redeploy
+5. Update Lipana webhook URL to `https://zenithfx.io/api/mpesa?action=callback`
+6. Update Supabase Google OAuth redirect to `https://zenithfx.io`
