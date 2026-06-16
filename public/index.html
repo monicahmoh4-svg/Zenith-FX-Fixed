@@ -571,7 +571,7 @@ footer{background:var(--bg2);border-top:1px solid var(--border2);padding:3.5rem 
           <svg width="16" height="16" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg>
           Google
         </button>
-        <button class="soc-btn" onclick="toast('📱 Coming Soon','Phone login coming soon.','info')">📱 Phone</button>
+        <button class="soc-btn" onclick="openModal('phoneModal')">📱 Phone</button>
       </div>
       <div class="auth-foot">Don't have an account? <a onclick="goto('register')">Sign up free</a></div>
     </div>
@@ -595,7 +595,7 @@ footer{background:var(--bg2);border-top:1px solid var(--border2);padding:3.5rem 
       <div style="margin-bottom:1rem;font-size:.74rem;color:var(--text3)">By signing up you agree to our <a style="color:var(--accent2);cursor:pointer">Terms of Service</a> and <a style="color:var(--accent2);cursor:pointer">Risk Disclosure</a>.</div>
       <button class="btn btn-primary btn-full btn-lg" id="rgBtn" onclick="doRegister()"><span id="rgTxt">Create Account — It's Free</span></button>
       <div class="auth-div">or</div>
-      <div class="social-row"><button class="soc-btn" onclick="doGoogleAuth()"><svg width="15" height="15" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg> Continue with Google</button></div>
+      <div class="social-row"><button class="soc-btn" onclick="doGoogleAuth()"><svg width="15" height="15" viewBox="0 0 24 24"><path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/><path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/></svg> Google</button><button class="soc-btn" onclick="openModal('phoneModal')">📱 Phone</button></div>
       <div class="auth-foot">Already have an account? <a onclick="goto('login')">Log in</a></div>
     </div>
   </div>
@@ -604,13 +604,43 @@ footer{background:var(--bg2);border-top:1px solid var(--border2);padding:3.5rem 
 <!-- ═══════════ FORGOT PASSWORD ═══════════ -->
 <div id="pg-forgot" class="page">
   <div class="auth-wrap">
-    <div class="auth-card">
+    <!-- Request reset link -->
+    <div class="auth-card" id="forgotRequestCard">
       <div class="auth-logo" onclick="goto('login')"><div class="logo" style="justify-content:center"><div class="logo-icon">Z</div><div class="logo-text" style="margin-left:8px">Zenith <span>FX</span></div></div></div>
       <div class="auth-title">Reset Password</div>
       <div class="auth-sub">Enter your email and we'll send a reset link.</div>
-      <div class="fg"><label class="fl">Email Address</label><input type="email" class="fi-inp" id="fpEmail" placeholder="you@example.com"></div>
+      <div class="fg"><label class="fl">Email Address</label><input type="email" class="fi-inp" id="fpEmail" placeholder="you@example.com" autocomplete="email"></div>
       <button class="btn btn-primary btn-full btn-lg" id="fpBtn" onclick="doForgot()"><span id="fpTxt">Send Reset Link</span></button>
       <div class="auth-foot"><a onclick="goto('login')">← Back to Login</a></div>
+    </div>
+    <!-- Set new password (shown after clicking the email link) -->
+    <div class="auth-card" id="newPassCard" style="display:none">
+      <div class="auth-logo"><div class="logo" style="justify-content:center"><div class="logo-icon">Z</div><div class="logo-text" style="margin-left:8px">Zenith <span>FX</span></div></div></div>
+      <div class="auth-title">Set New Password</div>
+      <div class="auth-sub">Choose a strong password for your account.</div>
+      <div class="fg"><label class="fl">New Password</label><div class="pw-wrap"><input type="password" class="fi-inp" id="newPassInp" placeholder="Min. 8 characters" autocomplete="new-password" oninput="pwStr(this)"><button class="tpass" onclick="togglePw('newPassInp',this)" type="button">👁️</button></div><div class="pw-str"><div class="pw-bar" id="pwBar2"></div></div></div>
+      <div class="fg"><label class="fl">Confirm Password</label><div class="pw-wrap"><input type="password" class="fi-inp" id="newPassInp2" placeholder="Repeat password" autocomplete="new-password"><button class="tpass" onclick="togglePw('newPassInp2',this)" type="button">👁️</button></div></div>
+      <button class="btn btn-primary btn-full btn-lg" id="newPassBtn" onclick="doUpdatePassword()"><span id="newPassBtnTxt">Set New Password</span></button>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════ PHONE LOGIN MODAL ═══════════ -->
+<div class="overlay" id="phoneModal">
+  <div class="modal" style="max-width:380px">
+    <div class="mh"><div class="mt">📱 Phone Login</div><button class="mc" onclick="closeModal('phoneModal')">✕</button></div>
+    <div id="phoneStep1">
+      <p style="font-size:.83rem;color:var(--text2);margin-bottom:1.2rem;line-height:1.6">Enter your Safaricom number. We'll send a one-time code via SMS.</p>
+      <div class="fg"><label class="fl">Phone Number</label><input type="tel" class="fi-inp" id="otpPhone" placeholder="+254 7XX XXX XXX" autocomplete="tel"><div class="ferr" id="otpPhoneE">Enter a valid Kenyan number (07XX or 01XX).</div></div>
+      <div class="fg"><label class="fl">First Name</label><input type="text" class="fi-inp" id="otpFirst" placeholder="John" autocomplete="given-name"></div>
+      <div class="fg"><label class="fl">Last Name</label><input type="text" class="fi-inp" id="otpLast" placeholder="Doe" autocomplete="family-name"></div>
+      <button class="btn btn-primary btn-full btn-lg" id="otpSendBtn" onclick="doSendOtp()"><span id="otpSendTxt">Send OTP</span></button>
+    </div>
+    <div id="phoneStep2" style="display:none">
+      <p style="font-size:.83rem;color:var(--text2);margin-bottom:1.2rem;line-height:1.6">Enter the 6-digit code sent to <strong id="otpPhoneDisp" style="color:var(--text)"></strong></p>
+      <div class="fg"><label class="fl">OTP Code</label><input type="text" class="fi-inp" id="otpCode" placeholder="123456" maxlength="6" inputmode="numeric" autocomplete="one-time-code"></div>
+      <button class="btn btn-primary btn-full btn-lg" id="otpVerifyBtn" onclick="doVerifyOtp()"><span id="otpVerifyTxt">Verify & Login</span></button>
+      <div style="text-align:center;margin-top:.9rem"><a onclick="showPhoneStep1()" style="font-size:.8rem;color:var(--accent2);cursor:pointer">← Change number</a></div>
     </div>
   </div>
 </div>
@@ -1195,14 +1225,62 @@ async function doRegister() {
 
 async function doGoogleAuth() {
   try {
-    setBtnLoading('googleLoginBtn', null, '');
-    document.getElementById('googleLoginBtn').disabled = true;
     const d = await api('/api/auth?action=google-url');
-    window.location.href = d.url; // Supabase handles the redirect
+    if (d.url) {
+      window.location.href = d.url; // Supabase handles the full OAuth redirect
+    } else {
+      toast('❌ Google Auth Error', 'No redirect URL returned.', 'error');
+    }
   } catch (err) {
-    toast('❌ Google Auth Error', err.message, 'error');
-    document.getElementById('googleLoginBtn').disabled = false;
+    const msg = err?.message || err?.error || 'Google sign-in failed. Try again.';
+    toast('❌ Google Auth Error', msg, 'error');
   }
+}
+
+// ── PHONE OTP FUNCTIONS ───────────────────────────────────────────────────────
+function showPhoneStep1() {
+  document.getElementById('phoneStep1').style.display = 'block';
+  document.getElementById('phoneStep2').style.display = 'none';
+}
+
+async function doSendOtp() {
+  const phone = document.getElementById('otpPhone').value.trim();
+  if (!valPhone(phone)) { showErr('otpPhoneE', true); return; }
+  showErr('otpPhoneE', false);
+  setBtnLoading('otpSendBtn','otpSendTxt','Sending OTP…');
+  try {
+    await api('/api/auth?action=phone-otp-send', { phone });
+    const disp = document.getElementById('otpPhoneDisp');
+    if (disp) disp.textContent = phone;
+    document.getElementById('phoneStep1').style.display = 'none';
+    document.getElementById('phoneStep2').style.display = 'block';
+    toast('📱 OTP Sent!', 'Check your SMS messages for a 6-digit code.', 'success');
+  } catch (err) {
+    const msg = err?.message || err?.error || 'Failed to send OTP.';
+    toast('❌ OTP Error', msg, 'error');
+  } finally { resetBtn('otpSendBtn','otpSendTxt','Send OTP'); }
+}
+
+async function doVerifyOtp() {
+  const phone = document.getElementById('otpPhone').value.trim();
+  const token = document.getElementById('otpCode').value.trim();
+  const first = document.getElementById('otpFirst').value.trim();
+  const last  = document.getElementById('otpLast').value.trim();
+  if (!token || token.length < 4) { toast('⚠️ Enter OTP', 'Enter the 6-digit code from SMS.', 'warn'); return; }
+  setBtnLoading('otpVerifyBtn','otpVerifyTxt','Verifying…');
+  try {
+    const d = await api('/api/auth?action=phone-otp-verify', { phone, token, firstName: first, lastName: last });
+    A.token = d.session.access_token;
+    A.user  = d.user;
+    saveSession(d.session);
+    closeModal('phoneModal');
+    initDash();
+    goto('dashboard');
+    toast('✅ Phone Login Success!', `Welcome, ${A.user.firstName || phone}!`, 'success');
+  } catch (err) {
+    const msg = err?.message || err?.error || 'Verification failed.';
+    toast('❌ OTP Failed', msg, 'error');
+  } finally { resetBtn('otpVerifyBtn','otpVerifyTxt','Verify & Login'); }
 }
 
 async function doForgot() {
@@ -1210,12 +1288,50 @@ async function doForgot() {
   if (!valEmail(email)) { toast('⚠️ Invalid Email', 'Enter a valid email address.', 'warn'); return; }
   setBtnLoading('fpBtn','fpTxt','Sending…');
   try {
-    await api('/api/auth?action=reset-password', { email });
-    toast('📧 Reset Link Sent!', `Check ${email} for the reset link.`, 'success');
-    setTimeout(() => goto('login'), 2500);
+    // Always returns success (security best practice — doesn't reveal if email exists)
+    const d = await api('/api/auth?action=reset-password', { email });
+    // Replace the forgot card with a confirmation screen
+    const card = document.querySelector('#pg-forgot .auth-card');
+    if (card) {
+      card.innerHTML = `
+        <div style="text-align:center;padding:1rem 0">
+          <div style="font-size:3rem;margin-bottom:1rem">📧</div>
+          <div style="font-size:1.15rem;font-weight:800;margin-bottom:.5rem">Check your email</div>
+          <p style="color:var(--text2);font-size:.86rem;line-height:1.7;margin-bottom:1.3rem">
+            If <strong style="color:var(--text)">${email}</strong> is registered,<br>
+            a password reset link has been sent.<br>
+            <span style="font-size:.78rem;color:var(--text3)">Also check your spam / junk folder.</span>
+          </p>
+          <p style="color:var(--text2);font-size:.82rem;line-height:1.6;margin-bottom:1.5rem">
+            Click the link in the email, then you will be brought back here to set a new password.
+          </p>
+          <button class="btn btn-primary btn-full" onclick="goto('login')">← Back to Login</button>
+        </div>`;
+    }
   } catch (err) {
-    toast('❌ Error', err.message, 'error');
+    // Normalise — err.message may be undefined if Supabase returned a plain object
+    const msg = err?.message || err?.error || 'Something went wrong. Please try again.';
+    toast('❌ Error', msg, 'error');
   } finally { resetBtn('fpBtn','fpTxt','Send Reset Link'); }
+}
+
+// Called when user lands on /?page=reset-password after clicking the email link
+async function doUpdatePassword() {
+  const pass  = document.getElementById('newPassInp')?.value || '';
+  const pass2 = document.getElementById('newPassInp2')?.value || '';
+  if (pass.length < 8) { toast('⚠️ Too Short', 'Password must be at least 8 characters.', 'warn'); return; }
+  if (pass !== pass2)  { toast('⚠️ Mismatch', 'Passwords do not match.', 'warn'); return; }
+  setBtnLoading('newPassBtn','newPassBtnTxt','Updating…');
+  try {
+    await api('/api/auth?action=update-password', { password: pass });
+    toast('✅ Password Updated!', 'You can now log in with your new password.', 'success');
+    clearSession();
+    A.token = null;
+    setTimeout(() => goto('login'), 2000);
+  } catch (err) {
+    const msg = err?.message || err?.error || 'Failed to update password.';
+    toast('❌ Error', msg, 'error');
+  } finally { resetBtn('newPassBtn','newPassBtnTxt','Set New Password'); }
 }
 
 async function doLogout() {
@@ -1839,38 +1955,76 @@ window.addEventListener('resize', ()=>{
 
 // ── INIT ───────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
-  // Build ticker
   buildTickerBar();
-  // Start hero chart
   startHeroChart();
-  // Build asset list for trade panel
   buildAssetList();
-  // Bank ref
-  const br=document.getElementById('bankRef');if(br)br.textContent='ZFX-'+Math.random().toString(36).slice(2,8).toUpperCase();
-  // Check for Google OAuth callback in URL
-  const hash = window.location.hash;
-  const params = new URLSearchParams(hash.replace('#','?').startsWith('?')?hash.slice(1):hash);
-  const accessToken = params.get('access_token');
+  const br = document.getElementById('bankRef');
+  if (br) br.textContent = 'ZFX-' + Math.random().toString(36).slice(2,8).toUpperCase();
+
+  // ── Parse Supabase callback tokens from URL hash ──────────────────────────
+  // Supabase puts tokens in the URL fragment (#access_token=...&type=...)
+  // after OAuth, email confirmation, or password reset redirect.
+  const hash   = window.location.hash.slice(1); // remove leading #
+  const hParams = new URLSearchParams(hash);
+  const accessToken  = hParams.get('access_token');
+  const refreshToken = hParams.get('refresh_token');
+  const tokenType    = hParams.get('type'); // 'signup' | 'recovery' | 'magiclink'
+  const expiresAt    = hParams.get('expires_at');
+
   if (accessToken) {
+    // Clean the URL immediately so the token is not visible
+    window.history.replaceState({}, document.title, '/');
+
+    if (tokenType === 'recovery') {
+      // User clicked a password RESET link in their email
+      A.token = accessToken;
+      saveSession({ access_token: accessToken, refresh_token: refreshToken || '', expires_at: parseInt(expiresAt || 0) });
+      // Show the "Set New Password" card on the forgot page
+      const req  = document.getElementById('forgotRequestCard');
+      const npc  = document.getElementById('newPassCard');
+      if (req) req.style.display = 'none';
+      if (npc) npc.style.display = 'block';
+      goto('forgot');
+      toast('🔑 Set Your New Password', 'Enter and confirm your new password below.', 'info');
+      return;
+    }
+
+    if (tokenType === 'signup' || tokenType === 'magiclink' || tokenType === 'email') {
+      // User confirmed their email or used magic link — auto-login them
+      A.token = accessToken;
+      saveSession({ access_token: accessToken, refresh_token: refreshToken || '', expires_at: parseInt(expiresAt || 0) });
+      try {
+        const d = await api('/api/auth?action=me');
+        A.user = d.user;
+        initDash();
+        goto('dashboard');
+        toast('✅ Email Confirmed!', `Welcome to Zenith FX, ${A.user.firstName || ''}!`, 'success');
+      } catch (e) {
+        console.error('[callback] me failed:', e.message);
+        goto('login');
+        toast('✅ Email Verified!', 'Your email has been confirmed. Please log in.', 'success');
+      }
+      return;
+    }
+
+    // Generic token (e.g. Google OAuth) — attempt to fetch user
     A.token = accessToken;
-    localStorage.setItem('zfx_token', accessToken);
+    saveSession({ access_token: accessToken, refresh_token: refreshToken || '', expires_at: parseInt(expiresAt || 0) });
     try {
       const d = await api('/api/auth?action=me');
       A.user = d.user;
-      window.history.replaceState({}, '', '/');
       initDash();
       goto('dashboard');
-      toast('✅ Signed In!', `Welcome, ${A.user.firstName}!`, 'success');
-    } catch { goto('login'); }
+      toast('✅ Signed In!', `Welcome, ${A.user.firstName || ''}!`, 'success');
+    } catch (e) {
+      console.error('[callback] me failed:', e.message);
+      clearSession();
+      goto('login');
+    }
     return;
   }
-  // Check for password reset token
-  if (window.location.search.includes('page=reset-password') && accessToken) {
-    A.token = accessToken;
-    goto('forgot');
-    return;
-  }
-  // Restore session from localStorage
+
+  // ── No token in URL — try to restore saved session ────────────────────────
   const restored = await restoreSession();
   if (restored) {
     initDash();
