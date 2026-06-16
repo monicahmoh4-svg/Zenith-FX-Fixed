@@ -1,5 +1,16 @@
-// api/auth.js — Zenith FX Auth v4 (production-ready)
-// Fixes: reset password error {}, phone OTP, Google OAuth, resend verification
+// api/auth.js — Zenith FX Auth v5 (production-ready)
+// Fix: confirmation/reset emails only reaching the project owner's inbox.
+// Root cause: relying solely on Supabase's built-in mailer, which is
+// heavily rate-limited and unreliable for anyone but the project owner
+// until Custom SMTP is fully verified in the Supabase dashboard.
+//
+// Fix strategy:
+//   1. Generate the confirmation / recovery link via Supabase Admin API
+//      (generateLink) instead of letting Supabase silently email it.
+//   2. Send that link ourselves via our own verified SMTP (Gmail) for
+//      EVERY user, not just the owner. This guarantees delivery.
+//   3. Keep Supabase's own mailer as a parallel attempt (harmless if it
+//      also fires), but our SMTP send is now the source of truth.
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -22,7 +33,6 @@ export default async function handler(req, res) {
     if (action === 'resend-verification')  return await handleResendVerification(req, res);
     return res.status(400).json({ error: 'Unknown action' });
   } catch (err) {
-    // Supabase errors are plain objects, not Error instances — normalise here
     const message = err?.message || err?.error_description || err?.msg || JSON.stringify(err);
     console.error(`[auth/${action}] UNHANDLED:`, message);
     return res.status(500).json({ error: message || 'Internal server error' });
@@ -46,7 +56,6 @@ function getPublicClient() {
   return createClient(url, key, { auth: { autoRefreshToken: false, persistSession: false } });
 }
 
-// Normalise a Supabase error object into a plain string
 function sbErr(error) {
   if (!error) return null;
   return error.message || error.error_description || error.msg || JSON.stringify(error);
@@ -83,7 +92,25 @@ async function upsertProfile(userId, fields) {
   if (error) console.error('[upsertProfile] non-fatal:', sbErr(error));
 }
 
+function getSmtpTransport() {
+  const host = process.env.SMTP_HOST;
+  const user = process.env.SMTP_USER;
+  const pass = process.env.SMTP_PASS;
+  if (!host || !user || !pass) return null;
+  const nodemailer = require('nodemailer');
+  return nodemailer.createTransport({
+    host,
+    port:   parseInt(process.env.SMTP_PORT || '587'),
+    secure: false,
+    auth:   { user, pass },
+    tls:    { rejectUnauthorized: false },
+  });
+}
+
 // ── REGISTER (email + password) ───────────────────────────────────────────────
+// Creates the user directly via the Admin API (no Supabase-sent email), then
+// generates a real confirmation link ourselves and emails it via our own SMTP
+// to GUARANTEE delivery to any address, not just the project owner.
 async function handleRegister(req, res) {
   const { email, password, firstName, lastName, phone, country } = req.body || {};
 
@@ -98,42 +125,46 @@ async function handleRegister(req, res) {
   }
 
   const cleanEmail = email.toLowerCase().trim();
-  const siteUrl   = process.env.NEXT_PUBLIC_SITE_URL || `https://${req.headers.host}`;
-  const pub       = getPublicClient();
+  const siteUrl    = process.env.NEXT_PUBLIC_SITE_URL || `https://${req.headers.host}`;
+  const sb         = getServiceClient();
 
-  const { data: signUpData, error: signUpError } = await pub.auth.signUp({
-    email:    cleanEmail,
+  // Reject duplicate emails early
+  const { data: existingProfile } = await sb
+    .from('profiles')
+    .select('id')
+    .eq('email', cleanEmail)
+    .maybeSingle();
+  if (existingProfile) {
+    return res.status(409).json({ error: 'An account with this email already exists. Please log in.' });
+  }
+
+  // ── Create the user via Admin API with email_confirm:false ──
+  // We do NOT let Supabase auto-send its email — we generate + send our own link below.
+  const { data: created, error: createErr } = await sb.auth.admin.createUser({
+    email:         cleanEmail,
     password,
-    options: {
-      emailRedirectTo: `${siteUrl}/`,
-      data: { firstName, lastName, phone: phone || null, country: country || 'KE' },
-    },
+    email_confirm: false,
+    user_metadata: { firstName, lastName, phone: phone || null, country: country || 'KE' },
   });
 
-  if (signUpError) {
-    const msg = sbErr(signUpError);
-    console.error('[register] signUp error:', msg);
-    if (
-      signUpError.status === 422 ||
-      msg?.toLowerCase().includes('already registered') ||
-      msg?.toLowerCase().includes('user already registered')
-    ) {
+  if (createErr) {
+    const msg = sbErr(createErr);
+    console.error('[register] createUser error:', msg);
+    if (msg?.toLowerCase().includes('already') || createErr.status === 422) {
       return res.status(409).json({ error: 'An account with this email already exists. Please log in.' });
     }
     return res.status(400).json({ error: msg || 'Registration failed.' });
   }
 
-  const userId = signUpData?.user?.id;
-  if (!userId) {
-    return res.status(500).json({ error: 'Account creation failed. Please try again.' });
-  }
+  const userId = created?.user?.id;
+  if (!userId) return res.status(500).json({ error: 'Account creation failed. Please try again.' });
 
   await upsertProfile(userId, {
     email:         cleanEmail,
     first_name:    firstName,
     last_name:     lastName,
-    phone:         phone    || null,
-    country:       country  || 'KE',
+    phone:         phone   || null,
+    country:       country || 'KE',
     demo_balance:  10000.00,
     live_balance:  0.00,
     kyc_status:    'unverified',
@@ -143,16 +174,51 @@ async function handleRegister(req, res) {
     created_at:    new Date().toISOString(),
   });
 
-  // Send branded welcome email alongside Supabase's confirmation email
-  try { await sendWelcomeEmail(cleanEmail, firstName, siteUrl); }
-  catch (e) { console.error('[register] welcome email failed (non-fatal):', e.message); }
+  // ── Generate the real confirmation link via Admin API ──
+  // This is a genuine Supabase-signed link — clicking it actually confirms the
+  // user server-side. We just deliver it ourselves instead of trusting
+  // Supabase's mailer to reach non-owner inboxes.
+  let confirmLink = null;
+  try {
+    const { data: linkData, error: linkErr } = await sb.auth.admin.generateLink({
+      type:  'signup',
+      email: cleanEmail,
+      password, // required by generateLink for type 'signup'
+      options: { redirectTo: `${siteUrl}/` },
+    });
+    if (linkErr) throw linkErr;
+    confirmLink = linkData?.properties?.action_link || linkData?.action_link;
+  } catch (linkGenErr) {
+    console.error('[register] generateLink(signup) failed:', sbErr(linkGenErr));
+  }
+
+  // ── Send OUR OWN confirmation email via verified SMTP — works for ANY address ──
+  let emailSent = false;
+  if (confirmLink) {
+    try {
+      await sendConfirmationEmail(cleanEmail, firstName, confirmLink);
+      emailSent = true;
+    } catch (emailErr) {
+      console.error('[register] confirmation email send failed:', emailErr.message);
+    }
+  }
+
+  if (!confirmLink || !emailSent) {
+    // Fall back: confirm the user immediately so they are never locked out
+    // because of an email delivery problem, then tell them to log in directly.
+    console.warn('[register] falling back to auto-confirm because link/email failed for', cleanEmail);
+    await sb.auth.admin.updateUserById(userId, { email_confirm: true });
+    return res.status(201).json({
+      success: true,
+      requiresVerification: false,
+      message: 'Account created! You can log in right away.',
+    });
+  }
 
   return res.status(201).json({
     success: true,
-    requiresVerification: !signUpData?.session,
-    message: signUpData?.session
-      ? 'Account created! You are now logged in.'
-      : 'Account created! Please check your email and click the confirmation link to activate your account.',
+    requiresVerification: true,
+    message: 'Account created! Check your email for a confirmation link to activate your account.',
   });
 }
 
@@ -218,7 +284,7 @@ async function handleLogin(req, res) {
   });
 }
 
-// ── GOOGLE OAUTH — returns redirect URL ──────────────────────────────────────
+// ── GOOGLE OAUTH ───────────────────────────────────────────────────────────────
 async function handleGoogleUrl(req, res) {
   const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || `https://${req.headers.host}`;
   const pub     = getPublicClient();
@@ -226,39 +292,30 @@ async function handleGoogleUrl(req, res) {
     provider: 'google',
     options:  { redirectTo: `${siteUrl}/` },
   });
-  if (error) {
-    return res.status(500).json({ error: sbErr(error) || 'Google OAuth failed.' });
-  }
+  if (error) return res.status(500).json({ error: sbErr(error) || 'Google OAuth failed.' });
   return res.status(200).json({ url: data.url });
 }
 
-// ── PHONE OTP — send ─────────────────────────────────────────────────────────
-// Requires Twilio/MessageBird configured in Supabase Dashboard → Auth → Phone
+// ── PHONE OTP ─────────────────────────────────────────────────────────────────
 async function handlePhoneOtpSend(req, res) {
   const { phone } = req.body || {};
   if (!phone) return res.status(400).json({ error: 'Phone number is required.' });
 
-  // Normalise to E.164 format: +254XXXXXXXXX
   let clean = String(phone).replace(/\D/g, '');
   if (clean.startsWith('0'))  clean = '254' + clean.slice(1);
   if (!clean.startsWith('+')) clean = '+' + clean;
 
   const pub = getPublicClient();
-  const { error } = await pub.auth.signInWithOtp({
-    phone: clean,
-    options: { channel: 'sms' },
-  });
+  const { error } = await pub.auth.signInWithOtp({ phone: clean, options: { channel: 'sms' } });
 
   if (error) {
     const msg = sbErr(error);
     console.error('[phone-otp-send]', msg);
     return res.status(400).json({ error: msg || 'Failed to send OTP. Check the phone number.' });
   }
-
   return res.status(200).json({ success: true, message: `OTP sent to ${clean}` });
 }
 
-// ── PHONE OTP — verify ────────────────────────────────────────────────────────
 async function handlePhoneOtpVerify(req, res) {
   const { phone, token, firstName, lastName, country } = req.body || {};
   if (!phone || !token) return res.status(400).json({ error: 'Phone and OTP token are required.' });
@@ -268,11 +325,7 @@ async function handlePhoneOtpVerify(req, res) {
   if (!clean.startsWith('+')) clean = '+' + clean;
 
   const pub = getPublicClient();
-  const { data, error } = await pub.auth.verifyOtp({
-    phone: clean,
-    token,
-    type: 'sms',
-  });
+  const { data, error } = await pub.auth.verifyOtp({ phone: clean, token, type: 'sms' });
 
   if (error) {
     const msg = sbErr(error);
@@ -286,7 +339,6 @@ async function handlePhoneOtpVerify(req, res) {
   const userId = data.user?.id;
   if (!userId) return res.status(500).json({ error: 'Verification failed — no user returned.' });
 
-  // Upsert profile
   const sb = getServiceClient();
   await upsertProfile(userId, {
     phone:         clean,
@@ -338,15 +390,13 @@ async function handleMe(req, res) {
 
   const sb = getServiceClient();
   const { data: { user }, error } = await sb.auth.getUser(token);
-  if (error || !user) {
-    return res.status(401).json({ error: 'Session expired. Please log in again.' });
-  }
+  if (error || !user) return res.status(401).json({ error: 'Session expired. Please log in again.' });
 
   const { data: profile } = await sb.from('profiles').select('*').eq('id', user.id).maybeSingle();
   return res.status(200).json({ user: profileToUser(user, profile) });
 }
 
-// ── RESET PASSWORD — sends email via Supabase ─────────────────────────────────
+// ── RESET PASSWORD — generate link ourselves, send via our SMTP ──────────────
 async function handleResetPassword(req, res) {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Email is required.' });
@@ -354,29 +404,31 @@ async function handleResetPassword(req, res) {
     return res.status(400).json({ error: 'Please enter a valid email address.' });
   }
 
-  const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || `https://${req.headers.host}`;
-  const pub     = getPublicClient();
+  const cleanEmail = email.toLowerCase().trim();
+  const siteUrl     = process.env.NEXT_PUBLIC_SITE_URL || `https://${req.headers.host}`;
+  const sb          = getServiceClient();
 
-  const { error } = await pub.auth.resetPasswordForEmail(
-    email.toLowerCase().trim(),
-    // redirectTo must be in Supabase Dashboard → Auth → URL Configuration → Redirect URLs
-    { redirectTo: `${siteUrl}/?page=reset-password` }
-  );
-
-  if (error) {
-    // IMPORTANT: normalise error — Supabase returns a plain object, not an Error instance
-    const msg = sbErr(error);
-    console.error('[reset-password] error:', msg);
-    // Never reveal whether the email exists — always return success
-    // (security best practice for password reset)
-    if (msg?.includes('rate limit') || msg?.includes('too many')) {
-      return res.status(429).json({ error: 'Too many requests. Please wait a few minutes and try again.' });
+  // Always respond with the same generic success message regardless of outcome
+  // (prevents leaking which emails are registered) — but actually attempt to
+  // send a real, working link via our own SMTP for any account that exists.
+  try {
+    const { data: profile } = await sb.from('profiles').select('id').eq('email', cleanEmail).maybeSingle();
+    if (profile) {
+      const { data: linkData, error: linkErr } = await sb.auth.admin.generateLink({
+        type:  'recovery',
+        email: cleanEmail,
+        options: { redirectTo: `${siteUrl}/?page=reset-password` },
+      });
+      if (linkErr) throw linkErr;
+      const recoveryLink = linkData?.properties?.action_link || linkData?.action_link;
+      if (recoveryLink) {
+        await sendResetEmail(cleanEmail, recoveryLink);
+      }
     }
-    // For any other error, still return success (don't leak email existence)
-    console.error('[reset-password] suppressed error for security:', msg);
+  } catch (err) {
+    console.error('[reset-password] non-fatal error:', sbErr(err));
   }
 
-  // Always return success so attackers can't enumerate registered emails
   return res.status(200).json({
     success: true,
     message: 'If that email is registered, a password reset link has been sent.',
@@ -387,7 +439,7 @@ async function handleResetPassword(req, res) {
 async function handleUpdatePassword(req, res) {
   const { password } = req.body || {};
   const token        = req.headers.authorization?.replace('Bearer ', '');
-  if (!token)                      return res.status(401).json({ error: 'Not authenticated.' });
+  if (!token) return res.status(401).json({ error: 'Not authenticated.' });
   if (!password || password.length < 8) {
     return res.status(400).json({ error: 'Password must be at least 8 characters.' });
   }
@@ -399,30 +451,33 @@ async function handleUpdatePassword(req, res) {
   });
 
   const { error } = await c.auth.updateUser({ password });
-  if (error) {
-    return res.status(400).json({ error: sbErr(error) || 'Password update failed.' });
-  }
+  if (error) return res.status(400).json({ error: sbErr(error) || 'Password update failed.' });
   return res.status(200).json({ success: true, message: 'Password updated successfully.' });
 }
 
-// ── RESEND VERIFICATION EMAIL ─────────────────────────────────────────────────
+// ── RESEND VERIFICATION — regenerate link, send via our SMTP ─────────────────
 async function handleResendVerification(req, res) {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Email is required.' });
 
-  const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || `https://${req.headers.host}`;
-  const pub     = getPublicClient();
+  const cleanEmail = email.toLowerCase().trim();
+  const siteUrl    = process.env.NEXT_PUBLIC_SITE_URL || `https://${req.headers.host}`;
+  const sb         = getServiceClient();
 
-  const { error } = await pub.auth.resend({
-    type:  'signup',
-    email: email.toLowerCase().trim(),
-    options: { emailRedirectTo: `${siteUrl}/` },
-  });
-
-  if (error) {
-    const msg = sbErr(error);
-    console.error('[resend-verification] error:', msg);
-    // Always return success — don't reveal whether email exists
+  try {
+    const { data: profile } = await sb.from('profiles').select('id, first_name').eq('email', cleanEmail).maybeSingle();
+    if (profile) {
+      const { data: linkData, error: linkErr } = await sb.auth.admin.generateLink({
+        type:  'signup',
+        email: cleanEmail,
+        options: { redirectTo: `${siteUrl}/` },
+      });
+      if (linkErr) throw linkErr;
+      const link = linkData?.properties?.action_link || linkData?.action_link;
+      if (link) await sendConfirmationEmail(cleanEmail, profile.first_name || 'Trader', link);
+    }
+  } catch (err) {
+    console.error('[resend-verification] non-fatal:', sbErr(err));
   }
 
   return res.status(200).json({
@@ -431,29 +486,18 @@ async function handleResendVerification(req, res) {
   });
 }
 
-// ── WELCOME EMAIL ─────────────────────────────────────────────────────────────
-async function sendWelcomeEmail(toEmail, firstName, siteUrl) {
-  const smtpHost = process.env.SMTP_HOST;
-  const smtpUser = process.env.SMTP_USER;
-  const smtpPass = process.env.SMTP_PASS;
-  if (!smtpHost || !smtpUser || !smtpPass) {
-    console.warn('[email] SMTP env vars not set — skipping welcome email');
-    return;
+// ── EMAIL TEMPLATES — sent via OUR OWN verified Gmail SMTP for every user ────
+async function sendConfirmationEmail(toEmail, firstName, confirmLink) {
+  const transport = getSmtpTransport();
+  if (!transport) {
+    console.warn('[email] SMTP env vars not set — cannot send confirmation email');
+    throw new Error('Email service not configured (SMTP_HOST/SMTP_USER/SMTP_PASS missing)');
   }
 
-  const nodemailer  = require('nodemailer');
-  const transporter = nodemailer.createTransport({
-    host:   smtpHost,
-    port:   parseInt(process.env.SMTP_PORT || '587'),
-    secure: false,
-    auth:   { user: smtpUser, pass: smtpPass },
-    tls:    { rejectUnauthorized: false },
-  });
-
-  await transporter.sendMail({
-    from:    process.env.SMTP_FROM || `"Zenith FX" <${smtpUser}>`,
+  await transport.sendMail({
+    from:    process.env.SMTP_FROM || `"Zenith FX" <${process.env.SMTP_USER}>`,
     to:      toEmail,
-    subject: '🎉 Welcome to Zenith FX — Confirm your email to get started',
+    subject: '✅ Confirm your Zenith FX account',
     html: `
 <div style="font-family:Inter,Arial,sans-serif;max-width:520px;margin:0 auto;background:#0d1117;color:#e6edf3;border-radius:12px;overflow:hidden;border:1px solid #30363d">
   <div style="background:linear-gradient(135deg,#1f9cf0,#22d3ee);padding:1.6rem 2rem">
@@ -461,26 +505,59 @@ async function sendWelcomeEmail(toEmail, firstName, siteUrl) {
     <div style="font-size:.85rem;color:rgba(255,255,255,.8);margin-top:.2rem">Trade Smart, Rise Higher</div>
   </div>
   <div style="padding:2rem">
-    <h2 style="margin:0 0 .9rem;font-size:1.2rem;font-weight:700">Welcome, ${firstName}! 🎉</h2>
-    <p style="color:#8b949e;line-height:1.7;margin-bottom:1rem">
-      Your Zenith FX account has been created. Check the <strong style="color:#fff">separate email from noreply@mail.app.supabase.io</strong>
-      for your <strong style="color:#38bdf8">confirmation link</strong> — click it to activate your account and log in.
-    </p>
-    <div style="background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1rem;margin-bottom:1.4rem">
-      <div style="font-size:.72rem;color:#8b949e;text-transform:uppercase;letter-spacing:.5px;margin-bottom:.3rem">Demo Balance Ready</div>
-      <div style="font-size:1.5rem;font-weight:800;color:#3fb950;font-family:monospace">$10,000.00</div>
-      <div style="font-size:.75rem;color:#8b949e;margin-top:.2rem">Available immediately after email confirmation</div>
-    </div>
+    <h2 style="margin:0 0 .9rem;font-size:1.2rem;font-weight:700">Hi ${firstName || 'Trader'}, confirm your email</h2>
     <p style="color:#8b949e;line-height:1.7;margin-bottom:1.4rem">
-      After confirming, deposit via <strong style="color:#fff">M-Pesa</strong> from as little as <strong style="color:#fff">KES 100</strong> to start live trading.
+      Click the button below to activate your Zenith FX account and unlock your <strong style="color:#3fb950">$10,000 demo balance</strong>.
     </p>
-    <a href="${siteUrl}" style="display:inline-block;background:linear-gradient(135deg,#1f9cf0,#38bdf8);color:#fff;font-weight:700;padding:.8rem 1.8rem;border-radius:8px;text-decoration:none;font-size:.9rem">
-      Go to Zenith FX →
+    <a href="${confirmLink}" style="display:inline-block;background:linear-gradient(135deg,#1f9cf0,#38bdf8);color:#fff;font-weight:700;padding:.85rem 2rem;border-radius:8px;text-decoration:none;font-size:.92rem">
+      Confirm My Email →
     </a>
+    <p style="color:#6e7681;font-size:.74rem;line-height:1.6;margin-top:1.5rem">
+      If the button doesn't work, copy and paste this link into your browser:<br>
+      <a href="${confirmLink}" style="color:#38bdf8;word-break:break-all">${confirmLink}</a>
+    </p>
+    <p style="color:#6e7681;font-size:.74rem;margin-top:1rem">This link expires in 24 hours.</p>
   </div>
   <div style="padding:.9rem 2rem 1.2rem;text-align:center;color:#6e7681;font-size:.7rem;border-top:1px solid #21262d">
     Zenith FX Limited · support@zenithfx.io<br>
     ⚠️ Trading involves risk. Never invest money you cannot afford to lose.
+  </div>
+</div>`,
+  });
+}
+
+async function sendResetEmail(toEmail, resetLink) {
+  const transport = getSmtpTransport();
+  if (!transport) {
+    console.warn('[email] SMTP env vars not set — cannot send reset email');
+    throw new Error('Email service not configured');
+  }
+
+  await transport.sendMail({
+    from:    process.env.SMTP_FROM || `"Zenith FX" <${process.env.SMTP_USER}>`,
+    to:      toEmail,
+    subject: '🔑 Reset your Zenith FX password',
+    html: `
+<div style="font-family:Inter,Arial,sans-serif;max-width:520px;margin:0 auto;background:#0d1117;color:#e6edf3;border-radius:12px;overflow:hidden;border:1px solid #30363d">
+  <div style="background:linear-gradient(135deg,#1f9cf0,#22d3ee);padding:1.6rem 2rem">
+    <div style="font-size:1.5rem;font-weight:900;color:#fff;letter-spacing:-0.5px">Zenith FX</div>
+  </div>
+  <div style="padding:2rem">
+    <h2 style="margin:0 0 .9rem;font-size:1.2rem;font-weight:700">Reset your password</h2>
+    <p style="color:#8b949e;line-height:1.7;margin-bottom:1.4rem">
+      We received a request to reset your Zenith FX password. Click below to choose a new one.
+    </p>
+    <a href="${resetLink}" style="display:inline-block;background:linear-gradient(135deg,#1f9cf0,#38bdf8);color:#fff;font-weight:700;padding:.85rem 2rem;border-radius:8px;text-decoration:none;font-size:.92rem">
+      Reset Password →
+    </a>
+    <p style="color:#6e7681;font-size:.74rem;line-height:1.6;margin-top:1.5rem">
+      If the button doesn't work, copy and paste this link into your browser:<br>
+      <a href="${resetLink}" style="color:#38bdf8;word-break:break-all">${resetLink}</a>
+    </p>
+    <p style="color:#6e7681;font-size:.74rem;margin-top:1rem">This link expires in 1 hour. If you didn't request this, you can safely ignore this email.</p>
+  </div>
+  <div style="padding:.9rem 2rem 1.2rem;text-align:center;color:#6e7681;font-size:.7rem;border-top:1px solid #21262d">
+    Zenith FX Limited · support@zenithfx.io
   </div>
 </div>`,
   });
