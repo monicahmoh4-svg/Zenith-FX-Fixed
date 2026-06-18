@@ -1,16 +1,18 @@
 // api/mpesa.js — Zenith FX M-Pesa Integration via Paynecta (https://paynecta.co.ke)
 //
-// Paynecta API summary (from official docs/SDK):
-//   Base URL:    https://paynecta.co.ke/api/v1
-//   Auth:        Header "X-API-KEY: <key>" + "X-EMAIL: <email>" (API key + account email)
-//   STK Push:    POST /payments/initialize  { link_code, mobile_number, amount }
-//   Status:      GET  /payments/status/{transaction_reference}
-//   Webhook:     POST to your registered webhook URL on payment completion/failure
+// Paynecta's docs site is JS-rendered, so exact raw REST paths aren't
+// scrapeable from static HTML. To avoid "API endpoint not found" errors
+// caused by a path mismatch, this file tries several known/likely path
+// variants in order and surfaces Paynecta's REAL error message back to
+// you (in the toast + Vercel logs) so you can see exactly what Paynecta
+// is rejecting if all variants fail — instead of a generic dead end.
 //
-// IMPORTANT — Paynecta requires a "Payment Link" to be created in your
-// Paynecta Dashboard first (Dashboard → Payment Links → Create New).
-// Copy its "link_code" into the PAYNECTA_LINK_CODE env var below.
-// This is how Paynecta knows which merchant/till the STK push money goes to.
+// REQUIRED Vercel env vars (see bottom of this file for full list):
+//   PAYNECTA_API_KEY, PAYNECTA_EMAIL, PAYNECTA_LINK_CODE
+//
+// IMPORTANT: PAYNECTA_LINK_CODE comes from Paynecta Dashboard → Payment
+// Links → Create New Link. STK push is always routed through a link code,
+// confirmed by their official SDK: payments()->initialize($linkCode, $phone, $amount)
 
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -25,6 +27,7 @@ export default async function handler(req, res) {
     if (action === 'callback') return await handleCallback(req, res);
     if (action === 'status')   return await handleStatus(req, res);
     if (action === 'withdraw') return await handleWithdraw(req, res);
+    if (action === 'debug')    return await handleDebug(req, res); // diagnostic helper
     return res.status(400).json({ error: 'Unknown action' });
   } catch (err) {
     console.error(`[mpesa/${action}] UNHANDLED:`, err?.message, err?.stack);
@@ -47,45 +50,131 @@ const USD_KES = parseFloat(process.env.USD_KES_RATE || '130');
 function cleanPhone(raw) {
   let n = String(raw).replace(/\D/g, '');
   if (n.startsWith('0'))   n = '254' + n.slice(1);
-  if (n.startsWith('254')) return n;
   if (!n.startsWith('254')) n = '254' + n;
   return n;
 }
 function isKenyanPhone(n) { return /^254[17]\d{8}$/.test(n); }
 
-// ── PAYNECTA API CLIENT ─────────────────────────────────────────────────────────
-function paynectaHeaders() {
+// ── PAYNECTA CONFIG ──────────────────────────────────────────────────────────────
+function paynectaConfig() {
   const apiKey = process.env.PAYNECTA_API_KEY;
   const email  = process.env.PAYNECTA_EMAIL;
-  if (!apiKey || !email) {
-    throw Object.assign(new Error('PAYNECTA_API_KEY or PAYNECTA_EMAIL env var missing'), { status: 500 });
-  }
+  const base   = (process.env.PAYNECTA_BASE_URL || 'https://paynecta.co.ke/api/v1').replace(/\/+$/, '');
+  if (!apiKey) throw Object.assign(new Error('PAYNECTA_API_KEY env var missing'), { status: 500 });
+  if (!email)  throw Object.assign(new Error('PAYNECTA_EMAIL env var missing'), { status: 500 });
+  return { apiKey, email, base };
+}
+
+// Build the auth header set Paynecta documents: X-API-KEY + X-EMAIL.
+// We ALSO send Authorization: Bearer as a fallback in case the live API
+// expects bearer-token auth instead — sending both is harmless and Paynecta
+// will simply ignore the header it doesn't use.
+function paynectaHeaders({ apiKey, email }) {
   return {
-    'Content-Type': 'application/json',
-    'X-API-KEY':    apiKey,
-    'X-EMAIL':      email,
+    'Content-Type':  'application/json',
+    'Accept':        'application/json',
+    'X-API-KEY':     apiKey,
+    'X-EMAIL':       email,
+    'Authorization': `Bearer ${apiKey}`,
   };
 }
 
-function paynectaBaseUrl() {
-  return process.env.PAYNECTA_BASE_URL || 'https://paynecta.co.ke/api/v1';
+// Low-level fetch wrapper — returns { ok, status, json, raw, url }
+async function tryRequest(url, options) {
+  let response;
+  try {
+    response = await fetch(url, options);
+  } catch (networkErr) {
+    return { ok: false, status: 0, json: null, raw: networkErr.message, url, networkError: true };
+  }
+  const raw = await response.text();
+  let json = null;
+  try { json = JSON.parse(raw); } catch { /* not JSON */ }
+  return { ok: response.ok, status: response.status, json, raw, url };
 }
 
-async function paynectaRequest(path, options = {}) {
-  const url = `${paynectaBaseUrl()}${path}`;
-  const res = await fetch(url, {
-    ...options,
-    headers: { ...paynectaHeaders(), ...(options.headers || {}) },
-  });
-  const text = await res.text();
-  let json;
-  try { json = JSON.parse(text); } catch { json = { raw: text }; }
+// Does this response look like a routing 404 (wrong path) rather than a
+// genuine business-logic 404/400 from Paynecta?
+function looksLikeRouteNotFound(result) {
+  if (result.networkError) return false;
+  if (result.status !== 404) return false;
+  const text = (result.raw || '').toLowerCase();
+  // Typical framework "no route matched" responses
+  return (
+    text.includes('cannot ') && text.includes('route') ||
+    text.includes('not found') && text.includes('html') ||
+    text.includes('<!doctype html') ||
+    text === '' ||
+    (result.json === null) // non-JSON 404 body strongly suggests a webserver-level 404, not an API error
+  );
+}
 
-  if (!res.ok) {
-    const msg = json?.message || json?.error || `Paynecta API error (${res.status})`;
-    throw Object.assign(new Error(msg), { status: res.status, body: json });
+// Try a POST against multiple candidate paths in order; stop at the first
+// one that returns a JSON business response (success OR a real validation
+// error) — only fall through to the next candidate on a route-level 404.
+async function paynectaPostWithFallback(paths, body) {
+  const cfg = paynectaConfig();
+  const headers = paynectaHeaders(cfg);
+  const attempts = [];
+
+  for (const path of paths) {
+    const url = `${cfg.base}${path}`;
+    const result = await tryRequest(url, { method: 'POST', headers, body: JSON.stringify(body) });
+    attempts.push({ path, status: result.status, raw: (result.raw || '').slice(0, 300) });
+
+    if (result.networkError) continue; // try next candidate
+
+    if (result.ok) {
+      return { result, attempts };
+    }
+
+    if (!looksLikeRouteNotFound(result)) {
+      // This is a REAL error from Paynecta (auth failure, validation error,
+      // insufficient permissions, etc.) — surface it immediately instead of
+      // masking it by trying more paths.
+      return { result, attempts };
+    }
+    // else: looked like a dead route — try the next candidate path
   }
-  return json;
+
+  // Every candidate path looked like a dead route
+  const err = new Error(
+    'Paynecta API endpoint not found at any known path. ' +
+    'Verify PAYNECTA_BASE_URL and check your Paynecta dashboard for the exact API path, ' +
+    'or contact hello@paynecta.co.ke. Attempted: ' + attempts.map(a => `${a.path} (${a.status})`).join(', ')
+  );
+  err.status = 404;
+  err.attempts = attempts;
+  throw err;
+}
+
+async function paynectaGetWithFallback(paths) {
+  const cfg = paynectaConfig();
+  const headers = paynectaHeaders(cfg);
+  const attempts = [];
+
+  for (const path of paths) {
+    const url = `${cfg.base}${path}`;
+    const result = await tryRequest(url, { method: 'GET', headers });
+    attempts.push({ path, status: result.status, raw: (result.raw || '').slice(0, 300) });
+
+    if (result.networkError) continue;
+    if (result.ok) return { result, attempts };
+    if (!looksLikeRouteNotFound(result)) return { result, attempts };
+  }
+
+  const err = new Error('Paynecta status endpoint not found at any known path. Attempted: ' + attempts.map(a => `${a.path} (${a.status})`).join(', '));
+  err.status = 404;
+  err.attempts = attempts;
+  throw err;
+}
+
+function extractErrorMessage(json, raw, fallback) {
+  if (json) {
+    return json.message || json.error || json.errors?.[0]?.message || JSON.stringify(json).slice(0, 200);
+  }
+  if (raw && raw.length < 300) return raw;
+  return fallback;
 }
 
 // ── STK PUSH (DEPOSIT) ──────────────────────────────────────────────────────────
@@ -105,52 +194,86 @@ async function handleSTKPush(req, res) {
 
   const linkCode = process.env.PAYNECTA_LINK_CODE;
   if (!linkCode) {
-    return res.status(500).json({ error: 'PAYNECTA_LINK_CODE env var missing — create a Payment Link in your Paynecta dashboard first.' });
+    return res.status(500).json({ error: 'PAYNECTA_LINK_CODE env var missing — create a Payment Link in your Paynecta dashboard first (Dashboard → Payment Links → Create New).' });
   }
 
-  // ── Call Paynecta: Initialize STK Push ──
-  const data = await paynectaRequest('/payments/initialize', {
-    method: 'POST',
-    body: JSON.stringify({
-      link_code:     linkCode,
-      mobile_number: phoneClean,
-      amount:        kes,
-    }),
-  });
+  // Candidate request bodies — different field-naming conventions Paynecta's
+  // API might expect (snake_case is what the SDK config implies, but we also
+  // try camelCase as a safety net).
+  const bodyVariants = [
+    { link_code: linkCode, mobile_number: phoneClean, amount: kes },
+    { linkCode,             mobileNumber: phoneClean,  amount: kes },
+  ];
 
-  // Paynecta returns the transaction reference used to track this payment
-  const reference =
-    data?.data?.transaction_reference ||
-    data?.transaction_reference ||
-    data?.data?.reference ||
-    data?.reference;
+  // Candidate paths, most-likely-first based on official SDK base_url + REST conventions
+  const pathCandidates = [
+    '/payments/initialize',
+    `/payment-links/${linkCode}/initialize`,
+    '/stk-push',
+    '/stk/push',
+    '/payments/stk-push',
+    '/payment/initialize',
+  ];
 
-  if (!reference) {
-    console.error('[stkpush] Paynecta response missing reference:', JSON.stringify(data));
-    throw Object.assign(new Error('Paynecta did not return a transaction reference.'), { status: 502 });
+  let lastErr = null;
+  for (const body of bodyVariants) {
+    try {
+      const { result, attempts } = await paynectaPostWithFallback(pathCandidates, body);
+
+      if (!result.ok) {
+        const msg = extractErrorMessage(result.json, result.raw, `Paynecta returned HTTP ${result.status}`);
+        console.error('[stkpush] Paynecta rejected request:', msg, '| attempts:', JSON.stringify(attempts));
+        lastErr = Object.assign(new Error(msg), { status: result.status >= 400 && result.status < 500 ? 400 : 502 });
+        continue; // try next body variant
+      }
+
+      // SUCCESS — extract transaction reference (try every known field name)
+      const data = result.json;
+      const reference =
+        data?.data?.transaction_reference ||
+        data?.data?.transactionReference  ||
+        data?.transaction_reference       ||
+        data?.transactionReference        ||
+        data?.data?.reference             ||
+        data?.reference;
+
+      if (!reference) {
+        console.error('[stkpush] Paynecta success response missing reference field:', JSON.stringify(data));
+        lastErr = Object.assign(new Error('Paynecta accepted the request but did not return a transaction reference. Check Vercel logs for the raw response.'), { status: 502 });
+        continue;
+      }
+
+      // Persist pending transaction in Supabase
+      const sb = getSupabase();
+      const { error: insertErr } = await sb.from('transactions').insert({
+        id:                  reference,
+        user_id:             userId || null,
+        type:                'deposit',
+        status:              'pending',
+        amount_kes:          kes,
+        amount_usd:          parseFloat((kes / USD_KES).toFixed(2)),
+        phone:               phoneClean,
+        checkout_request_id: reference,
+        created_at:          new Date().toISOString(),
+      });
+      if (insertErr) console.error('[stkpush] failed to insert pending transaction:', insertErr.message);
+
+      console.log('[stkpush] SUCCESS via path used. Reference:', reference);
+      return res.status(200).json({
+        success:           true,
+        message:           'STK Push sent. Enter your M-Pesa PIN to complete the deposit.',
+        transactionId:     reference,
+        checkoutRequestId: reference,
+      });
+
+    } catch (throwErr) {
+      lastErr = throwErr;
+      continue; // try next body variant
+    }
   }
 
-  // Persist pending transaction in Supabase — this is what the callback/poll updates
-  const sb = getSupabase();
-  const { error: insertErr } = await sb.from('transactions').insert({
-    id:                  reference,
-    user_id:             userId || null,
-    type:                'deposit',
-    status:              'pending',
-    amount_kes:          kes,
-    amount_usd:          parseFloat((kes / USD_KES).toFixed(2)),
-    phone:               phoneClean,
-    checkout_request_id: reference,
-    created_at:          new Date().toISOString(),
-  });
-  if (insertErr) console.error('[stkpush] failed to insert pending transaction:', insertErr.message);
-
-  return res.status(200).json({
-    success:       true,
-    message:       'STK Push sent. Enter your M-Pesa PIN to complete the deposit.',
-    transactionId: reference,
-    checkoutRequestId: reference,
-  });
+  // All variants exhausted — surface the most informative error we collected
+  throw lastErr || Object.assign(new Error('Paynecta STK push failed for an unknown reason.'), { status: 502 });
 }
 
 // ── WEBHOOK CALLBACK FROM PAYNECTA ──────────────────────────────────────────────
@@ -161,20 +284,16 @@ async function handleCallback(req, res) {
 
   const body = req.body || {};
 
-  // Paynecta webhook payload fields (per official SDK events):
-  //   transactionReference, amount, mpesaReceiptNumber, mobileNumber, status
-  const reference   = body.transactionReference || body.transaction_reference || body.reference;
-  const statusRaw   = (body.status || body.event || '').toString().toLowerCase();
-  const mpesaReceipt = body.mpesaReceiptNumber || body.mpesa_receipt_number || body.receipt || null;
-  const amountKes    = parseFloat(body.amount || 0);
-  const mobile        = (body.mobileNumber || body.mobile_number || '').replace(/^\+/, '');
+  const reference    = body.transactionReference || body.transaction_reference || body.reference || body.data?.transactionReference || body.data?.transaction_reference;
+  const statusRaw     = (body.status || body.event || body.data?.status || '').toString().toLowerCase();
+  const mpesaReceipt  = body.mpesaReceiptNumber || body.mpesa_receipt_number || body.receipt || body.data?.mpesaReceiptNumber || null;
+  const amountKes     = parseFloat(body.amount || body.data?.amount || 0);
 
   if (!reference) {
-    console.warn('[paynecta-callback] missing transaction reference — ignoring');
+    console.warn('[paynecta-callback] missing transaction reference — ignoring. Raw body:', JSON.stringify(body));
     return res.status(200).json({ received: true, ignored: true });
   }
 
-  // Determine final status: COMPLETED -> success, FAILED/CANCELLED -> failed
   let finalStatus = 'pending';
   if (statusRaw.includes('complet') || statusRaw.includes('success')) finalStatus = 'success';
   else if (statusRaw.includes('fail') || statusRaw.includes('cancel') || statusRaw.includes('declin')) finalStatus = 'failed';
@@ -183,11 +302,7 @@ async function handleCallback(req, res) {
 
   const { data: txRow, error: updateErr } = await sb
     .from('transactions')
-    .update({
-      status:        finalStatus,
-      mpesa_receipt: mpesaReceipt,
-      updated_at:    new Date().toISOString(),
-    })
+    .update({ status: finalStatus, mpesa_receipt: mpesaReceipt, updated_at: new Date().toISOString() })
     .eq('id', reference)
     .select()
     .maybeSingle();
@@ -197,18 +312,15 @@ async function handleCallback(req, res) {
   if (finalStatus === 'success' && txRow?.user_id) {
     const usdCredit = txRow.amount_usd || parseFloat((amountKes / USD_KES).toFixed(2));
 
-    // Credit balance via RPC (atomic increment)
     const { error: rpcErr } = await sb.rpc('credit_balance', { p_user_id: txRow.user_id, p_amount: usdCredit });
     if (rpcErr) {
-      console.error('[paynecta-callback] credit_balance RPC failed:', rpcErr.message);
-      // Fallback: direct update
+      console.error('[paynecta-callback] credit_balance RPC failed, using direct update fallback:', rpcErr.message);
       const { data: profile } = await sb.from('profiles').select('live_balance').eq('id', txRow.user_id).single();
       if (profile) {
         await sb.from('profiles').update({ live_balance: parseFloat(profile.live_balance || 0) + usdCredit }).eq('id', txRow.user_id);
       }
     }
 
-    // Email confirmation (non-blocking, best effort)
     try {
       const siteUrl = process.env.NEXT_PUBLIC_SITE_URL || `https://${req.headers.host}`;
       await fetch(`${siteUrl}/api/email?action=depositConfirmed`, {
@@ -219,7 +331,6 @@ async function handleCallback(req, res) {
     } catch (e) { console.error('[paynecta-callback] email notify failed (non-fatal):', e.message); }
   }
 
-  // Always 200 — tells Paynecta the webhook was received so it stops retrying
   return res.status(200).json({ received: true, status: finalStatus });
 }
 
@@ -231,7 +342,6 @@ async function handleStatus(req, res) {
 
   const sb = getSupabase();
 
-  // 1. Check our own DB first (fastest, updated by webhook)
   const { data: row } = await sb
     .from('transactions')
     .select('status, amount_usd, amount_kes, mpesa_receipt, user_id')
@@ -247,10 +357,22 @@ async function handleStatus(req, res) {
     });
   }
 
-  // 2. Still pending in our DB — actively query Paynecta in case the webhook
-  //    hasn't arrived yet (network delay, etc.)
+  // Still pending — actively query Paynecta in case the webhook hasn't landed yet
   try {
-    const data = await paynectaRequest(`/payments/status/${encodeURIComponent(id)}`, { method: 'GET' });
+    const pathCandidates = [
+      `/payments/status/${encodeURIComponent(id)}`,
+      `/payments/query/${encodeURIComponent(id)}`,
+      `/payments/${encodeURIComponent(id)}/status`,
+      `/transactions/${encodeURIComponent(id)}`,
+    ];
+    const { result } = await paynectaGetWithFallback(pathCandidates);
+
+    if (!result.ok) {
+      // Don't fail the poll loop hard — just report still-pending and let the frontend retry
+      return res.status(200).json({ status: row?.status || 'pending' });
+    }
+
+    const data = result.json;
     const statusRaw = (data?.data?.status || data?.status || '').toString().toLowerCase();
 
     let finalStatus = 'pending';
@@ -258,15 +380,13 @@ async function handleStatus(req, res) {
     else if (statusRaw.includes('fail') || statusRaw.includes('cancel') || statusRaw.includes('declin')) finalStatus = 'failed';
 
     if (finalStatus !== 'pending' && row) {
-      // Sync our DB and credit balance if we missed the webhook
       const mpesaReceipt = data?.data?.mpesa_receipt_number || data?.data?.mpesaReceiptNumber || null;
       await sb.from('transactions').update({
         status: finalStatus, mpesa_receipt: mpesaReceipt, updated_at: new Date().toISOString(),
       }).eq('id', id);
 
       if (finalStatus === 'success' && row.user_id) {
-        const usdCredit = row.amount_usd;
-        await sb.rpc('credit_balance', { p_user_id: row.user_id, p_amount: usdCredit }).catch(() => {});
+        await sb.rpc('credit_balance', { p_user_id: row.user_id, p_amount: row.amount_usd }).catch(() => {});
       }
     }
 
@@ -283,11 +403,6 @@ async function handleStatus(req, res) {
 }
 
 // ── WITHDRAW ─────────────────────────────────────────────────────────────────
-// NOTE: Paynecta's public API/SDK (as documented) covers STK Push collections,
-// payment links, banks and currency rates — it does not document a B2C/payout
-// endpoint. If your Paynecta account has B2C enabled, set PAYNECTA_B2C_PATH to
-// the exact path your dashboard/support gives you; otherwise withdrawals are
-// queued for manual processing by your team (still updates user balance safely).
 async function handleWithdraw(req, res) {
   const { phone, amountUsd, userId } = req.body || {};
   if (!phone || !amountUsd || !userId) {
@@ -308,20 +423,19 @@ async function handleWithdraw(req, res) {
 
   const kesAmount = Math.floor(usd * USD_KES);
 
-  // Debit immediately (re-credit on failure below)
   const { error: debitErr } = await sb.rpc('debit_balance', { p_user_id: userId, p_amount: usd });
   if (debitErr) throw Object.assign(new Error('Failed to debit balance: ' + debitErr.message), { status: 500 });
 
   const txnId = `WD_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-  const b2cPath = process.env.PAYNECTA_B2C_PATH; // optional — only if your account has payouts enabled
+  const b2cPath = process.env.PAYNECTA_B2C_PATH;
 
   try {
     if (b2cPath) {
-      // Attempt automated payout if Paynecta has enabled B2C for this account
-      await paynectaRequest(b2cPath, {
-        method: 'POST',
-        body: JSON.stringify({ mobile_number: phoneClean, amount: kesAmount, reference: txnId }),
-      });
+      const { result } = await paynectaPostWithFallback([b2cPath], { mobile_number: phoneClean, amount: kesAmount, reference: txnId });
+      if (!result.ok) {
+        const msg = extractErrorMessage(result.json, result.raw, `Paynecta payout returned HTTP ${result.status}`);
+        throw Object.assign(new Error(msg), { status: 502 });
+      }
       await sb.from('transactions').insert({
         id: txnId, user_id: userId, type: 'withdrawal', status: 'processing',
         amount_kes: kesAmount, amount_usd: usd, phone: phoneClean, created_at: new Date().toISOString(),
@@ -333,8 +447,7 @@ async function handleWithdraw(req, res) {
       });
     }
 
-    // No automated payout configured — queue for manual processing by your team.
-    // Balance has already been safely debited so it cannot be double-spent.
+    // No automated payout configured — queue for manual processing.
     await sb.from('transactions').insert({
       id: txnId, user_id: userId, type: 'withdrawal', status: 'processing',
       amount_kes: kesAmount, amount_usd: usd, phone: phoneClean, created_at: new Date().toISOString(),
@@ -346,8 +459,36 @@ async function handleWithdraw(req, res) {
       transactionId: txnId,
     });
   } catch (err) {
-    // Re-credit on any failure so the user never loses funds
     await sb.rpc('credit_balance', { p_user_id: userId, p_amount: usd }).catch(() => {});
     throw err;
+  }
+}
+
+// ── DEBUG HELPER ─────────────────────────────────────────────────────────────────
+// Call once manually to see exactly what Paynecta returns for each candidate path.
+// Visit: https://your-site.vercel.app/api/mpesa?action=debug  (GET, no auth needed)
+// REMOVE or protect this route once you've confirmed the correct path.
+async function handleDebug(req, res) {
+  try {
+    const cfg = paynectaConfig();
+    const headers = paynectaHeaders(cfg);
+    const testPaths = [
+      '/payments/initialize',
+      '/stk-push',
+      '/stk/push',
+      '/payments/stk-push',
+      '/payment/initialize',
+      '/payment-links',
+      '/banks',
+    ];
+    const results = [];
+    for (const path of testPaths) {
+      const url = `${cfg.base}${path}`;
+      const r = await tryRequest(url, { method: 'GET', headers });
+      results.push({ path, url, status: r.status, bodyPreview: (r.raw || '').slice(0, 200) });
+    }
+    return res.status(200).json({ base: cfg.base, results });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
   }
 }
